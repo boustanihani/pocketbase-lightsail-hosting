@@ -709,36 +709,6 @@ sysctl -p
 echo "Installation completed at $(date)" > /var/log/setup-complete.log
 ```
 
-**How to customize the script:**
-
-Before pasting the script, edit the configuration variables at the top:
-
-```bash
-# App configuration
-POCKETBASE_VERSION="0.31.0"          # Change to any version you want
-POCKETBASE_EMAIL="user@provider.com" # Set your admin email
-POCKETBASE_PASS="12345678"           # Set your admin password
-FILEBROWSER_VERSION="2.44.2"         # Change to any version you want
-
-# To enable HTTPS: replace ":80" with your domain (e.g., "sub.domain.ext")
-CUSTOM_DOMAIN=":80"                  # Keep ":80" for HTTP, or set to "sub.domain.ext" for HTTPS
-```
-
-**Important:** Change `POCKETBASE_EMAIL` and `POCKETBASE_PASS` to your desired admin credentials before launching!
-
-**Examples:**
-
-*HTTP only (default):*
-```bash
-CUSTOM_DOMAIN=":80"
-```
-
-*HTTPS with your domain:*
-
-```bash
-CUSTOM_DOMAIN="sub.domain.ext"
-```
-
 **Important:** After using the launch script:
 
 1. **Wait 3-5 minutes** for installation to complete
