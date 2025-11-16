@@ -392,9 +392,7 @@ sudo sysctl -p
 
 ## Enabling HTTPS (After DNS is Configured)
 
-Once your domain is pointing to your instance:
-
-### Option A: Quick Edit in SSH
+Once your domain is pointing to your instance (after creating an A record pointing to your static IP):
 
 ```bash
 sudo nano /etc/caddy/Caddyfile
