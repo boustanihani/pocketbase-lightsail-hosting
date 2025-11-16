@@ -12,12 +12,43 @@ This guide will help you host two applications on a single AWS Lightsail instanc
 - Filebrowser is configured to manage the Pocketbase directory (`/myapps/pocketbase`) for easy file management
 - Filebrowser does NOT start automatically - start it manually with `sudo supervisorctl start filebrowser` when needed
 - Filebrowser requires the `--baseurl` flag for proper asset loading under `/filebrowser`
-- The launch script sets up HTTP; HTTPS is configured by simply adding your domain to the Caddyfile
+- [The launch script](#complete-launch-script) sets up HTTP; HTTPS is configured by simply adding your domain to the Caddyfile
 - SSHGuard is installed and active for SSH brute-force protection (no configuration needed)
 - Enhanced network security settings are applied
 - File upload size is limited to 10MB (configurable in Caddyfile)
 - Pocketbase has a 6-minute (360 seconds) timeout for long-running operations
 - Use `btop` command for system resource monitoring
+
+---
+
+# Table of Contents
+
+- [Overview](#overview)
+- [Quick Start (Automated)](#quick-start-automated)
+  - [Option 1: Use the Launch Script](#option-1-use-the-launch-script)
+- [Manual Installation (Step-by-Step)](#manual-installation-step-by-step)
+  - [Step 1: Create Your Lightsail Instance](#step-1-create-your-lightsail-instance)
+  - [Step 2: Connect via SSH](#step-2-connect-via-ssh)
+  - [Step 3: Update System and Install Dependencies](#step-3-update-system-and-install-dependencies)
+  - [Step 4: Install Caddy](#step-4-install-caddy)
+  - [Step 5: Create Directory Structure](#step-5-create-directory-structure)
+  - [Step 6: Download and Install Pocketbase](#step-6-download-and-install-pocketbase)
+  - [Step 7: Download and Install Filebrowser](#step-7-download-and-install-filebrowser)
+  - [Step 8: Configure Supervisor for Pocketbase](#step-8-configure-supervisor-for-pocketbase)
+  - [Step 9: Configure Supervisor for Filebrowser](#step-9-configure-supervisor-for-filebrowser)
+  - [Step 10: Load Supervisor Configurations](#step-10-load-supervisor-configurations)
+  - [Step 11: Configure Caddy](#step-11-configure-caddy)
+  - [Step 12: Reload Caddy](#step-12-reload-caddy)
+  - [Step 13: Configure SSH Security](#step-13-configure-ssh-security)
+  - [Step 14: Configure Network Security Settings](#step-14-configure-network-security-settings)
+  - [Step 15: Open Firewall Ports](#step-15-open-firewall-ports)
+- [Enabling HTTPS (After DNS is Configured)](#enabling-https-after-dns-is-configured)
+- [Supervisor Quick Reference](#supervisor-quick-reference)
+- [Default Credentials](#default-credentials)
+- [Directory Structure](#directory-structure)
+- [Troubleshooting](#troubleshooting)
+- [Next Steps](#next-steps)
+- [Complete Launch Script](#complete-launch-script)
 
 ---
 
@@ -32,7 +63,7 @@ When creating your Lightsail instance:
 3. Select **Linux/Unix** platform
 4. Choose **OS Only** → **Ubuntu 24.04 LTS**
 5. Scroll to **Add launch script**
-6. Copy and paste the **complete launch script** from the end of this guide
+6. Copy and paste the [complete launch script](#complete-launch-script) from the end of this guide
 7. Choose your instance plan (minimum: $5/month)
 8. Click **Create instance**
 
