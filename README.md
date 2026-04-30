@@ -1,32 +1,34 @@
-# Hosting Pocketbase and Filebrowser on AWS Lightsail
+# Hosting Pocketbase, Filebrowser, and a Node.js app on AWS Lightsail
 
 ## Overview
 
-This guide will help you host two applications on a single AWS Lightsail instance:
+This guide will help you host three applications on a single AWS Lightsail instance:
 - **Pocketbase** at: `http://your-ip/` or `https://your-domain/`
-- **Filebrowser** at: `http://your-ip/filebrowser` or `https://your-domain/filebrowser`
+- **Filebrowser** at: `http://your-ip/filebrowser/` or `https://your-domain/filebrowser/`
+- **Node.js app** at: `http://your-ip/nodeapp/` or `https://your-domain/nodeapp/`
 
 **Important Notes:**
 
 - Pocketbase is served at the root path for simplest access
-- Filebrowser is configured to manage the entire `/myapps` directory (Caddy, Pocketbase, and Filebrowser subdirectories)
+- Filebrowser is configured to manage the entire `/myapps` directory (Caddy, Pocketbase, Filebrowser, and Nodeapp subdirectories)
 - Filebrowser requires the `--baseurl` flag for proper asset loading under `/filebrowser`
 - Filebrowser login is rate-limited to 5 attempts per minute per IP via Caddy
 - Caddy is installed as a prebuilt binary with the `mholt/caddy-ratelimit` module included
-- All services (Caddy, Pocketbase, Filebrowser) start automatically and are managed via Supervisor under `/myapps`
-- The script always installs the latest versions of Pocketbase and Filebrowser via the GitHub API
+- Node.js (configurable major version, default 22.x) is installed from NodeSource so Ubuntu's outdated package isn't used
+- Each service's autostart behavior is controlled by `AUTOSTART_CADDY`, `AUTOSTART_POCKETBASE`, `AUTOSTART_FILEBROWSER`, and `AUTOSTART_NODEAPP` at the top of `script.sh` — Caddy, Pocketbase, and Filebrowser default to `true`; `AUTOSTART_NODEAPP` defaults to `false` because no app code exists yet (see [Activating the Node.js App](#activating-the-nodejs-app))
+- On first install, autostart values come from the `AUTOSTART_*` variables at the top of `script.sh` (which are baked into the Supervisor configs). On later update runs, `install-update-binaries.sh` reads the `autostart` value directly from each Supervisor config in `/etc/supervisor/conf.d/`, so anything you flip there is respected without touching `script.sh`
+- All services (Caddy, Pocketbase, Filebrowser, Nodeapp) are managed via Supervisor under `/myapps`
+- Binary installation and updates share a single script (`/myapps/install-update-binaries.sh`) — the launch script invokes it for the initial install, and you re-run it later for updates
 - The launch script sets up HTTP; HTTPS is configured by simply adding your domain to the Caddyfile
-- SSHGuard is installed and active for SSH brute-force protection (no configuration needed)
+- SSHGuard is installed and active for SSH brute-force protection (no configuration needed). Note: bans are applied locally via nftables; they don't appear in the Lightsail firewall console.
 - Enhanced network security settings are applied for DDoS protection and security hardening
-- File upload size is limited to 10MB (configurable in Caddyfile)
+- File upload size is limited to 100MB (configurable in Caddyfile)
 - Pocketbase has a 6-minute timeout for long-running operations
 - `btop` is installed for system resource monitoring
 
 ---
 
 ## Quick Start (Automated)
-
-### Option 1: Use the Launch Script
 
 When creating your Lightsail instance:
 
@@ -38,13 +40,18 @@ When creating your Lightsail instance:
 6. Copy and paste the contents of [`script.sh`](./script.sh) (in this repo)
 7. Choose your instance plan (minimum: $5/month)
 8. Click **Create instance**
-9. Wait 3-5 minutes after the instance starts.
-10. Quick Check: `cat /var/log/setup-complete.log`
+9. Wait 3–5 minutes after the instance starts.
+10. Quick Check: `sudo tail /var/log/cloud-init-output.log`
+
+Under the hood, `script.sh` writes the system configuration (Caddyfile, Supervisor configs, SSH/sysctl hardening) and then invokes `/myapps/install-update-binaries.sh` to download and install Caddy, Pocketbase, Filebrowser, and Node.js. That same helper script is also what you run later to update everything — see [Updating All Binaries](#updating-all-binaries).
+
+> **Note on script size:** Keep `script.sh` under ~12KB raw. Lightsail limits user-data to 16KB *after* base64 encoding, which adds ~33% overhead. If you extend the script, watch the size.
 
 **Initial Access (HTTP):**
 - Pocketbase Public Page: `http://YOUR_IP/` (sample page: "Seite in Arbeit...")
 - Pocketbase Admin: `http://YOUR_IP/_/` (login with credentials from `POCKETBASE_EMAIL` and `POCKETBASE_PASS`)
 - Filebrowser: `http://YOUR_IP/filebrowser` (check `/myapps/filebrowser/filebrowser.err.log` for the initial credentials)
+- Nodeapp: not running yet — see [Activating the Node.js App](#activating-the-nodejs-app)
 
 **After DNS Configuration:**
 Edit the script variable `CUSTOM_DOMAIN=":80"` to your domain before launch, or follow the "Enabling HTTPS" section below to secure your site with SSL certificates.
@@ -77,131 +84,15 @@ sudo apt update && sudo apt upgrade -y
 sudo apt install -y curl jq supervisor unzip sshguard tilde btop unattended-upgrades
 ```
 
-### Step 4: Install Caddy (Prebuilt with Rate Limiting)
+If you're scripting this rather than running it interactively, also `export DEBIAN_FRONTEND=noninteractive` and `export NEEDRESTART_MODE=a` first — without these, kernel-upgrade dialogs and needrestart prompts can wedge debconf and silently break later steps (notably NodeSource's setup script).
 
-Caddy is installed as a prebuilt binary from the official Caddy download API. This build includes the `mholt/caddy-ratelimit` module for protecting the Filebrowser login endpoint.
-
-```bash
-sudo mkdir -p /myapps/caddy
-sudo curl -o /myapps/caddy/caddy "https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com/mholt/caddy-ratelimit"
-sudo chmod +x /myapps/caddy/caddy
-```
-
-### Step 5: Create Directory Structure
+### Step 4: Create Directory Structure
 
 ```bash
-sudo mkdir -p /myapps/pocketbase /myapps/filebrowser
+sudo mkdir -p /myapps/caddy /myapps/pocketbase /myapps/filebrowser /myapps/nodeapp
 ```
 
-### Step 6: Download and Install Pocketbase (Latest)
-
-```bash
-PB_VERSION=$(curl -s https://api.github.com/repos/pocketbase/pocketbase/releases/latest | jq -r '.tag_name | ltrimstr("v")')
-cd /myapps/pocketbase
-sudo wget "https://github.com/pocketbase/pocketbase/releases/download/v${PB_VERSION}/pocketbase_${PB_VERSION}_linux_amd64.zip"
-sudo unzip "pocketbase_${PB_VERSION}_linux_amd64.zip"
-sudo rm "pocketbase_${PB_VERSION}_linux_amd64.zip"
-sudo chmod +x pocketbase
-```
-
-**Optional:** Create a superuser now (or do it later via the Admin UI):
-```bash
-cd /myapps/pocketbase
-sudo ./pocketbase superuser create your-email@example.com your-password
-```
-
-**Optional:** Create a sample public page:
-```bash
-sudo mkdir -p /myapps/pocketbase/pb_public
-sudo bash -c 'cat > /myapps/pocketbase/pb_public/index.html <<EOF
-<!DOCTYPE html><html lang="de"><head><meta charset="utf-8"></head><body><h1>Seite in Arbeit...</h1></body></html>
-EOF'
-```
-
-### Step 7: Download and Install Filebrowser (Latest)
-
-```bash
-FB_VERSION=$(curl -s https://api.github.com/repos/filebrowser/filebrowser/releases/latest | jq -r '.tag_name | ltrimstr("v")')
-cd /myapps/filebrowser
-sudo wget "https://github.com/filebrowser/filebrowser/releases/download/v${FB_VERSION}/linux-amd64-filebrowser.tar.gz"
-sudo tar -xzf linux-amd64-filebrowser.tar.gz
-sudo rm linux-amd64-filebrowser.tar.gz
-sudo chmod +x filebrowser
-```
-
-### Step 8: Configure Supervisor for Caddy
-
-```bash
-sudo nano /etc/supervisor/conf.d/caddy.conf
-```
-
-Paste this configuration:
-
-```ini
-[program:caddy]
-directory=/myapps/caddy
-command=/myapps/caddy/caddy run --config /myapps/caddy/Caddyfile
-environment=XDG_DATA_HOME="/myapps/caddy/data",XDG_CONFIG_HOME="/myapps/caddy/config"
-autostart=true
-autorestart=true
-stderr_logfile=/myapps/caddy/caddy.err.log
-stdout_logfile=/myapps/caddy/caddy.out.log
-logfile_maxbytes=10MB
-logfile_backups=5
-user=root
-```
-
-Save and exit (Ctrl+X, then Y, then Enter)
-
-**Note:** Caddy needs to bind to port 80/443, which requires root. Since Supervisor runs this process as `user=root`, this works as-is.
-
-### Step 9: Configure Supervisor for Pocketbase
-
-```bash
-sudo nano /etc/supervisor/conf.d/pocketbase.conf
-```
-
-Paste this configuration:
-
-```ini
-[program:pocketbase]
-directory=/myapps/pocketbase
-command=/myapps/pocketbase/pocketbase serve --http=127.0.0.1:8090
-autostart=true
-autorestart=true
-stderr_logfile=/myapps/pocketbase/pocketbase.err.log
-stdout_logfile=/myapps/pocketbase/pocketbase.out.log
-logfile_maxbytes=10MB
-logfile_backups=5
-user=root
-```
-
-Save and exit (Ctrl+X, then Y, then Enter)
-
-### Step 10: Configure Supervisor for Filebrowser
-
-```bash
-sudo nano /etc/supervisor/conf.d/filebrowser.conf
-```
-
-Paste this configuration:
-
-```ini
-[program:filebrowser]
-directory=/myapps/filebrowser
-command=/myapps/filebrowser/filebrowser -r /myapps -a 127.0.0.1 -p 8091 --baseurl /filebrowser
-autostart=true
-autorestart=true
-stderr_logfile=/myapps/filebrowser/filebrowser.err.log
-stdout_logfile=/myapps/filebrowser/filebrowser.out.log
-logfile_maxbytes=10MB
-logfile_backups=5
-user=root
-```
-
-Save and exit (Ctrl+X, then Y, then Enter)
-
-### Step 11: Configure Caddy
+### Step 5: Configure Caddy
 
 ```bash
 sudo nano /myapps/caddy/Caddyfile
@@ -216,10 +107,9 @@ Paste the following content:
 
 :80 {
     request_body {
-        max_size 10MB
+        max_size 100MB
     }
 
-    # Filebrowser (must come before root)
     handle /filebrowser {
         redir {path}/ permanent
     }
@@ -238,7 +128,13 @@ Paste the following content:
         reverse_proxy localhost:8091
     }
 
-    # Pocketbase
+    handle /nodeapp {
+        redir {path}/ permanent
+    }
+    handle /nodeapp/* {
+        reverse_proxy localhost:8092
+    }
+
     handle {
         reverse_proxy localhost:8090 {
             transport http {
@@ -251,14 +147,107 @@ Paste the following content:
 
 Save and exit (Ctrl+X, then Y, then Enter)
 
-### Step 12: Load Supervisor Configurations
+### Step 6: Configure Supervisor for Caddy
 
 ```bash
-sudo supervisorctl reread
-sudo supervisorctl update
+sudo nano /etc/supervisor/conf.d/caddy.conf
 ```
 
-All three services will start automatically. Check status:
+Paste this configuration:
+
+```ini
+[program:caddy]
+directory=/myapps/caddy
+command=/myapps/caddy/caddy run --config /myapps/caddy/Caddyfile
+environment=XDG_DATA_HOME="/myapps/caddy/data",XDG_CONFIG_HOME="/myapps/caddy/config"
+autostart=true
+autorestart=true
+stderr_logfile=/myapps/caddy/caddy.err.log
+stdout_logfile=/myapps/caddy/caddy.out.log
+user=root
+```
+
+**Note:** Caddy needs to bind to port 80/443, which requires root. Since Supervisor runs this process as `user=root`, this works as-is.
+
+### Step 7: Configure Supervisor for Pocketbase
+
+```bash
+sudo nano /etc/supervisor/conf.d/pocketbase.conf
+```
+
+Paste this configuration:
+
+```ini
+[program:pocketbase]
+directory=/myapps/pocketbase
+command=/myapps/pocketbase/pocketbase serve --http=127.0.0.1:8090
+autostart=true
+autorestart=true
+stderr_logfile=/myapps/pocketbase/pocketbase.err.log
+stdout_logfile=/myapps/pocketbase/pocketbase.out.log
+user=root
+```
+
+### Step 8: Configure Supervisor for Filebrowser
+
+```bash
+sudo nano /etc/supervisor/conf.d/filebrowser.conf
+```
+
+Paste this configuration:
+
+```ini
+[program:filebrowser]
+directory=/myapps/filebrowser
+command=/myapps/filebrowser/filebrowser -r /myapps -a 127.0.0.1 -p 8091 --baseurl /filebrowser
+autostart=true
+autorestart=true
+stderr_logfile=/myapps/filebrowser/filebrowser.err.log
+stdout_logfile=/myapps/filebrowser/filebrowser.out.log
+user=root
+```
+
+### Step 9: Configure Supervisor for Nodeapp
+
+```bash
+sudo nano /etc/supervisor/conf.d/nodeapp.conf
+```
+
+Paste this configuration:
+
+```ini
+[program:nodeapp]
+directory=/myapps/nodeapp
+command=/usr/bin/node /myapps/nodeapp/index.js
+environment=NODE_ENV="production",PORT="8092"
+autostart=false
+autorestart=true
+startsecs=5
+startretries=3
+stopsignal=TERM
+stopwaitsecs=15
+stderr_logfile=/myapps/nodeapp/nodeapp.err.log
+stdout_logfile=/myapps/nodeapp/nodeapp.out.log
+user=root
+```
+
+**Note:** `autostart=false` is intentional — there's no app code yet. You'll flip this to `true` after uploading your app (see [Activating the Node.js App](#activating-the-nodejs-app)).
+
+### Step 10: Install All Binaries
+
+The install/update script content is embedded in [`script.sh`](./script.sh) — copy the heredoc between the `BINEOF` markers, save it to `/myapps/install-update-binaries.sh`, make it executable, then run it with the `--first-run` flag:
+
+```bash
+sudo chmod +x /myapps/install-update-binaries.sh
+sudo bash /myapps/install-update-binaries.sh --first-run
+```
+
+This downloads and installs Caddy (with the rate-limiting module), Pocketbase, Filebrowser, and Node.js, then registers the Supervisor configs (which auto-starts Caddy, Pocketbase, and Filebrowser since their `autostart=true`; Nodeapp stays stopped because its `autostart=false`).
+
+The same script is reused later for updates — without the `--first-run` flag — see [Updating All Binaries](#updating-all-binaries).
+
+Verify everything is running:
+
 ```bash
 sudo supervisorctl status
 ```
@@ -267,31 +256,35 @@ You should see:
 - `caddy RUNNING`
 - `pocketbase RUNNING`
 - `filebrowser RUNNING`
+- `nodeapp STOPPED`
 
-### Step 13: Configure SSH Security
+### Step 11: Create the Pocketbase Superuser (Optional)
 
-Configure SSH for key-based authentication only:
+You can do this now via the CLI, or later through the Admin UI:
 
 ```bash
-sudo nano /etc/ssh/sshd_config
+sudo /myapps/pocketbase/pocketbase superuser create your-email@example.com your-password
 ```
 
-Find and modify these lines (remove `#` if commented):
-
+**Optional:** Create a sample public page:
+```bash
+sudo mkdir -p /myapps/pocketbase/pb_public
+sudo bash -c 'cat > /myapps/pocketbase/pb_public/index.html <<EOF
+<!DOCTYPE html><html lang="de"><head><meta charset="utf-8"></head><body><h1>Seite in Arbeit...</h1></body></html>
+EOF'
 ```
+
+### Step 12: Configure SSH Security
+
+Configure SSH for key-based authentication only by adding a drop-in file (this approach doesn't mutate the upstream `/etc/ssh/sshd_config` and survives package upgrades):
+
+```bash
+sudo tee /etc/ssh/sshd_config.d/99-hardening.conf > /dev/null <<EOF
 PubkeyAuthentication yes
 PasswordAuthentication no
 ChallengeResponseAuthentication no
 UsePAM yes
-```
-
-**Or use this automated approach:**
-
-```bash
-sudo sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-sudo sed -i 's/^#*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
-sudo sed -i 's/^#*UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
+EOF
 ```
 
 Restart SSH to apply changes:
@@ -301,40 +294,25 @@ sudo systemctl restart ssh
 
 **Important:** After this step, only key-based SSH authentication will work! Make sure you have your SSH keys configured.
 
-### Step 14: Configure Network Security Settings
+### Step 13: Configure Network Security Settings
 
-Configure kernel network parameters for enhanced security.
+Configure kernel network parameters for enhanced security by adding a drop-in file (idempotent and doesn't mutate `/etc/sysctl.conf`):
 
 ```bash
-sudo nano /etc/sysctl.conf
-```
-
-Ensure these lines exist with these exact values:
-
-```conf
+sudo tee /etc/sysctl.d/99-hardening.conf > /dev/null <<EOF
 net.ipv4.conf.default.rp_filter=1
 net.ipv4.conf.all.rp_filter=1
 net.ipv4.conf.all.accept_redirects=0
 net.ipv4.conf.default.accept_redirects=0
 net.ipv4.conf.all.send_redirects=0
 net.ipv4.conf.all.log_martians=1
-```
-
-**Or use this automated approach with sed commands:**
-
-```bash
-sudo sed -i '/net\.ipv4\.conf\.default\.rp_filter/c\net.ipv4.conf.default.rp_filter=1' /etc/sysctl.conf
-sudo sed -i '/net\.ipv4\.conf\.all\.rp_filter/c\net.ipv4.conf.all.rp_filter=1' /etc/sysctl.conf
-sudo sed -i '/net\.ipv4\.conf\.all\.accept_redirects/c\net.ipv4.conf.all.accept_redirects=0' /etc/sysctl.conf
-sudo sed -i '/net\.ipv4\.conf\.default\.accept_redirects/c\net.ipv4.conf.default.accept_redirects=0' /etc/sysctl.conf
-sudo sed -i '/net\.ipv4\.conf\.all\.send_redirects/c\net.ipv4.conf.all.send_redirects=0' /etc/sysctl.conf
-sudo sed -i '/net\.ipv4\.conf\.all\.log_martians/c\net.ipv4.conf.all.log_martians=1' /etc/sysctl.conf
+EOF
 ```
 
 **Apply the changes:**
 
 ```bash
-sudo sysctl -p
+sudo sysctl --system
 
 # Verify
 sudo sysctl net.ipv4.conf.all.rp_filter
@@ -343,6 +321,8 @@ sudo sysctl net.ipv4.conf.all.send_redirects
 sudo sysctl net.ipv4.conf.all.log_martians
 ```
 
+> **Note:** Use `sysctl --system` (not `sysctl -p`) so the drop-in file in `/etc/sysctl.d/` is actually read — plain `-p` only reloads `/etc/sysctl.conf`.
+
 **What these settings do:**
 
 - **Spoof protection (rp_filter)**: Validates that packets are coming from legitimate sources
@@ -350,7 +330,7 @@ sudo sysctl net.ipv4.conf.all.log_martians
 - **Disable send redirects**: This is an application server, not a router
 - **Log Martians**: Records packets with impossible source addresses to help detect attacks
 
-### Step 15: Open Firewall Ports
+### Step 14: Open Firewall Ports
 
 1. Go to your Lightsail instance in AWS Console
 2. Click on the **Networking** tab
@@ -359,6 +339,70 @@ sudo sysctl net.ipv4.conf.all.log_martians
    - **HTTP** (TCP 80)
    - **HTTPS** (TCP 443)
 4. Click **Save** if you made any changes
+
+---
+
+## Activating the Node.js App
+
+The launch script installs Node.js and prepares a Supervisor entry for `nodeapp`, but the service starts disabled (`autostart=false`) because there's no app code yet. Here's how to deploy your app:
+
+### Step 1: Upload Your App Code
+
+Open Filebrowser at `http://YOUR_IP/filebrowser` and upload your app files into `/myapps/nodeapp/`. At minimum you need an `index.js` (the entry point referenced in the Supervisor config). If your app has dependencies, also upload `package.json` (and optionally `package-lock.json`).
+
+The included Supervisor config expects:
+- Entry point: `/myapps/nodeapp/index.js`
+- App listens on `127.0.0.1:8092` (Caddy proxies `/nodeapp/*` to this port)
+
+The `PORT` environment variable is set to `8092` by Supervisor, so use `process.env.PORT` in your code.
+
+### Step 2: Install Dependencies (If Any)
+
+If your app uses npm packages, SSH in and install them:
+
+```bash
+cd /myapps/nodeapp
+sudo npm install --omit=dev
+```
+
+`--omit=dev` skips dev dependencies, which you don't want on a production server.
+
+### Step 3: Enable Autostart
+
+Edit the Supervisor config and flip `autostart` to `true`:
+
+```bash
+sudo sed -i 's/^autostart=false/autostart=true/' /etc/supervisor/conf.d/nodeapp.conf
+```
+
+Then tell Supervisor to pick up the change and start the service:
+
+```bash
+sudo supervisorctl reread
+sudo supervisorctl update
+sudo supervisorctl start nodeapp
+```
+
+### Step 4: Verify
+
+```bash
+sudo supervisorctl status nodeapp        # should say RUNNING
+curl http://127.0.0.1:8092/              # direct hit on the app
+curl http://127.0.0.1/nodeapp/           # through Caddy
+sudo tail -f /myapps/nodeapp/nodeapp.err.log
+```
+
+If something's wrong, check the error log first — Node uncaught exceptions land there.
+
+### Updating Your App Code
+
+Upload new files via Filebrowser (or `scp`), then restart:
+
+```bash
+sudo supervisorctl restart nodeapp
+```
+
+If you changed dependencies (`package.json`), run `sudo npm install --omit=dev` in `/myapps/nodeapp/` before restarting.
 
 ---
 
@@ -399,27 +443,33 @@ sudo supervisorctl status
 sudo supervisorctl start caddy
 sudo supervisorctl start pocketbase
 sudo supervisorctl start filebrowser
+sudo supervisorctl start nodeapp
 
 sudo supervisorctl stop caddy
 sudo supervisorctl stop pocketbase
 sudo supervisorctl stop filebrowser
+sudo supervisorctl stop nodeapp
 
 sudo supervisorctl restart caddy
 sudo supervisorctl restart pocketbase
 sudo supervisorctl restart filebrowser
+sudo supervisorctl restart nodeapp
 
 sudo tail -f /myapps/caddy/caddy.err.log
 sudo tail -f /myapps/pocketbase/pocketbase.err.log
 sudo tail -f /myapps/filebrowser/filebrowser.err.log
+sudo tail -f /myapps/nodeapp/nodeapp.err.log
 ```
 
 ### Updating All Binaries
 
-An update script is included at `/myapps/update-myapps.sh` (source: [`update-myapps.sh`](./update-myapps.sh) in this repo). It stops all services, downloads the latest versions of Caddy, Pocketbase, and Filebrowser, validates the downloads, and restarts everything.
+The same script that performs the initial install (`/myapps/install-update-binaries.sh`, content embedded in [`script.sh`](./script.sh) between the `BINEOF` markers) is also used for updates. The first install is invoked with `--first-run` (which skips the stop/backup/restart logic since nothing is running yet); for updates, run it without the flag. Update mode stops the services, backs up current binaries, downloads the latest versions of Caddy, Pocketbase, Filebrowser, and Node.js (within the configured `NODE_MAJOR` line), validates the downloads, and restarts each service whose Supervisor config has `autostart=true`.
 
 ```bash
-sudo bash /myapps/update-myapps.sh
+sudo bash /myapps/install-update-binaries.sh
 ```
+
+Services with `autostart=false` are left stopped after the update — only their binaries are refreshed. This applies uniformly to all four services, so e.g. flipping Pocketbase to `autostart=false` and re-running the script will update Pocketbase's binary without starting it.
 
 ---
 
@@ -435,6 +485,9 @@ sudo bash /myapps/update-myapps.sh
 - Default username: `admin`
 - First-time credentials are shown in: `/myapps/filebrowser/filebrowser.err.log`
 
+**Nodeapp:**
+- No default credentials — your app handles its own auth (or doesn't, depending on what you build).
+
 ---
 
 ## Directory Structure
@@ -443,7 +496,7 @@ After installation, your directory structure will look like:
 
 ```
 /myapps/
-├── update-myapps.sh (update script for all binaries)
+├── install-update-binaries.sh (install/update script for all binaries)
 ├── caddy/
 │   ├── caddy (executable, prebuilt with rate limiting module)
 │   ├── Caddyfile
@@ -458,14 +511,20 @@ After installation, your directory structure will look like:
 │   │   └── index.html (sample page)
 │   ├── pocketbase.err.log
 │   └── pocketbase.out.log
-└── filebrowser/
-    ├── filebrowser (executable)
-    ├── filebrowser.db
-    ├── filebrowser.out.log
-    └── filebrowser.err.log
+├── filebrowser/
+│   ├── filebrowser (executable)
+│   ├── filebrowser.db
+│   ├── filebrowser.out.log
+│   └── filebrowser.err.log
+└── nodeapp/
+    ├── index.js (your code, uploaded via Filebrowser)
+    ├── package.json (if your app has dependencies)
+    ├── node_modules/ (created by `npm install`)
+    ├── nodeapp.err.log
+    └── nodeapp.out.log
 ```
 
-**Note:** Filebrowser is configured to show and manage the entire `/myapps` directory (Caddy, Pocketbase, and Filebrowser subdirectories).
+**Note:** Filebrowser is configured to show and manage the entire `/myapps` directory.
 
 ---
 
@@ -477,6 +536,7 @@ sudo supervisorctl status
 sudo tail -f /myapps/caddy/caddy.err.log
 sudo tail -f /myapps/pocketbase/pocketbase.err.log
 sudo tail -f /myapps/filebrowser/filebrowser.err.log
+sudo tail -f /myapps/nodeapp/nodeapp.err.log
 ```
 
 ### Can't access via browser?
@@ -487,6 +547,16 @@ sudo tail -f /myapps/filebrowser/filebrowser.err.log
 ### Pocketbase Admin UI not loading?
 - Make sure to access: `http://YOUR_IP/_/` (note the trailing slash and underscore)
 - Check that Pocketbase is running: `sudo supervisorctl status pocketbase`
+
+### Nodeapp won't start?
+- Confirm `autostart=true` in `/etc/supervisor/conf.d/nodeapp.conf`, then `sudo supervisorctl reread && sudo supervisorctl update`
+- Confirm `index.js` exists at `/myapps/nodeapp/index.js`
+- Check that the app listens on `127.0.0.1:8092` (or `process.env.PORT`), not on `0.0.0.0` or some other port — Caddy expects 8092
+- Check the error log: `sudo tail -50 /myapps/nodeapp/nodeapp.err.log`
+- If your app has dependencies and `node_modules/` is missing, run `cd /myapps/nodeapp && sudo npm install --omit=dev`
+
+### Nodeapp returns 502 Bad Gateway?
+- The app is registered with Caddy but isn't actually running. Check `sudo supervisorctl status nodeapp` and the error log.
 
 ### HTTPS Issues
 

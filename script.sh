@@ -1,80 +1,56 @@
 #!/bin/bash
 #
-# AWS Lightsail launch script - Pocketbase + Filebrowser + Caddy.
-#
-# IMPORTANT: This script is written to be POSIX-compatible (no bashisms in the
-# top-level setup) so it works whether cloud-init runs it under bash or dash.
-# Run manually with:  sudo bash script.sh   (NOT `sudo sh script.sh`)
+# AWS Lightsail launch script - Pocketbase + Filebrowser + Caddy + Node.js
+# Keep under ~12KB raw (Lightsail limits base64-encoded user-data to 16KB)
 
-# INIT SCRIPT LOGS:
 # sudo cat /var/log/cloud-init-output.log
 # sudo tail -f /var/log/cloud-init-output.log (FOLLOW LIVE)
 # sudo cat /var/log/cloud-init-output.log | curl -s -F "content=<-" https://dpaste.com/api/v2/
-
-# FILEBROWSER CREDENTIALS:
 # sudo cat /myapps/filebrowser/filebrowser.err.log | grep -i password
-# sudo head -20 /myapps/filebrowser/filebrowser.err.log
+
+AUTOSTART_CADDY=true
+AUTOSTART_FILEBROWSER=true
+AUTOSTART_POCKETBASE=true
+AUTOSTART_NODEAPP=false
 
 POCKETBASE_EMAIL="user@provider.com"
 POCKETBASE_PASS="12345678"
 
-# To enable HTTPS: replace ":80" with your domain (e.g., "sub.domain.ext")
+# For HTTPS: replace ":80" with your domain & open port 443
 CUSTOM_DOMAIN=":80"
 
+NODEAPP_RUN=index.js
+NODEAPP_PORT=8092
+
+export DEBIAN_FRONTEND=noninteractive # Do not ask questions
+export NEEDRESTART_MODE=a # Restart systemd services if needed
+
 apt update && apt upgrade -y
-
 apt install -y curl jq supervisor unzip sshguard tilde btop unattended-upgrades
+mkdir -p /myapps/caddy /myapps/pocketbase /myapps/filebrowser /myapps/nodeapp
 
-mkdir -p /myapps/pocketbase /myapps/filebrowser /myapps/caddy
-
-# Fetch latest versions
-POCKETBASE_VERSION=$(curl -s https://api.github.com/repos/pocketbase/pocketbase/releases/latest | jq -r '.tag_name | ltrimstr("v")')
-FILEBROWSER_VERSION=$(curl -s https://api.github.com/repos/filebrowser/filebrowser/releases/latest | jq -r '.tag_name | ltrimstr("v")')
-
-if [ -z "$POCKETBASE_VERSION" ] || [ "$POCKETBASE_VERSION" = "null" ]; then
-    echo "ERROR: Failed to fetch latest Pocketbase version. Aborting." >&2
-    exit 1
-fi
-if [ -z "$FILEBROWSER_VERSION" ] || [ "$FILEBROWSER_VERSION" = "null" ]; then
-    echo "ERROR: Failed to fetch latest Filebrowser version. Aborting." >&2
-    exit 1
-fi
-
-# Install Caddy with rate limiting module (prebuilt from Caddy's download API)
-curl -fsSL -o /myapps/caddy/caddy "https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com/mholt/caddy-ratelimit"
-if [ ! -s /myapps/caddy/caddy ]; then
-    echo "ERROR: Caddy download failed or empty. Aborting." >&2
-    exit 1
-fi
-chmod +x /myapps/caddy/caddy
-
-cd /myapps/pocketbase
-wget -q "https://github.com/pocketbase/pocketbase/releases/download/v${POCKETBASE_VERSION}/pocketbase_${POCKETBASE_VERSION}_linux_amd64.zip"
-unzip -q "pocketbase_${POCKETBASE_VERSION}_linux_amd64.zip"
-rm "pocketbase_${POCKETBASE_VERSION}_linux_amd64.zip"
-chmod +x pocketbase
-
-# `|| true` so re-runs don't fail if the superuser already exists
-./pocketbase superuser create "${POCKETBASE_EMAIL}" "${POCKETBASE_PASS}" || true
-
-mkdir -p pb_public
-cat > pb_public/index.html <<'EOF'
-<!DOCTYPE html><html lang="de"><head><meta charset="utf-8"></head><body><h1>Seite in Arbeit...</h1></body></html>
-EOF
-
-cd /myapps/filebrowser
-wget -q "https://github.com/filebrowser/filebrowser/releases/download/v${FILEBROWSER_VERSION}/linux-amd64-filebrowser.tar.gz"
-tar -xzf linux-amd64-filebrowser.tar.gz
-rm linux-amd64-filebrowser.tar.gz
-chmod +x filebrowser
-
-cat > /myapps/update-myapps.sh <<'UPDATEEOF'
+# Quoted heredoc — no var expansion
+cat > /myapps/install-update-binaries.sh <<'BINEOF'
 #!/bin/bash
+# pipefail catches `curl | bash` failures (e.g. NodeSource bailing on debconf).
+set -eo pipefail
 
-# Update script for Caddy, Pocketbase, and Filebrowser
-# Usage: sudo bash /myapps/update-myapps.sh
+NODE_MAJOR=22
 
-set -e
+# --first-run is passed by script.sh on initial install.
+# In that mode we skip stop/backup/restart logic since there's nothing running yet.
+FIRST_RUN=false
+[ "$1" = "--first-run" ] && FIRST_RUN=true
+
+# Start a Supervisor program only if its config has autostart=true.
+start_if_autostart() {
+    local prog="$1" conf="/etc/supervisor/conf.d/$1.conf"
+    if [ -f "$conf" ] && grep -qE '^autostart\s*=\s*true\s*$' "$conf"; then
+        supervisorctl start "$prog"
+    else
+        echo "($prog skipped — autostart not true)"
+    fi
+}
 
 echo "=== Fetching latest versions ==="
 
@@ -82,74 +58,78 @@ POCKETBASE_LATEST=$(curl -s https://api.github.com/repos/pocketbase/pocketbase/r
 FILEBROWSER_LATEST=$(curl -s https://api.github.com/repos/filebrowser/filebrowser/releases/latest | jq -r '.tag_name | ltrimstr("v")')
 
 if [ -z "$POCKETBASE_LATEST" ] || [ "$POCKETBASE_LATEST" = "null" ]; then
-    echo "ERROR: Failed to fetch latest Pocketbase version. Aborting." >&2
-    exit 1
+    echo "ERROR: Failed to fetch Pocketbase version. Aborting." >&2; exit 1
 fi
 if [ -z "$FILEBROWSER_LATEST" ] || [ "$FILEBROWSER_LATEST" = "null" ]; then
-    echo "ERROR: Failed to fetch latest Filebrowser version. Aborting." >&2
-    exit 1
+    echo "ERROR: Failed to fetch Filebrowser version. Aborting." >&2; exit 1
 fi
 
-# Match a proper X.Y.Z semver (skipping leading `v` if present) and take only the first hit.
-# Filebrowser appends a commit hash like `v2.63.2/7970c26c`,
-# which the broader pattern `[\d.]+` would split into multiple matches.
-POCKETBASE_CURRENT=$(/myapps/pocketbase/pocketbase --version 2>/dev/null | grep -oP 'v?\K\d+\.\d+\.\d+' | head -n1 || echo "unknown")
-FILEBROWSER_CURRENT=$(/myapps/filebrowser/filebrowser version 2>/dev/null | grep -oP 'v?\K\d+\.\d+\.\d+' | head -n1 || echo "unknown")
-CADDY_CURRENT=$(/myapps/caddy/caddy version 2>/dev/null | grep -oP 'v?\K\d+\.\d+\.\d+' | head -n1 || echo "unknown")
+# X.Y.Z semver match, first hit only (filebrowser appends a commit hash).
+POCKETBASE_CURRENT=$(/myapps/pocketbase/pocketbase --version 2>/dev/null | grep -oP 'v?\K\d+\.\d+\.\d+' | head -n1 || echo "none")
+FILEBROWSER_CURRENT=$(/myapps/filebrowser/filebrowser version 2>/dev/null | grep -oP 'v?\K\d+\.\d+\.\d+' | head -n1 || echo "none")
+CADDY_CURRENT=$(/myapps/caddy/caddy version 2>/dev/null | grep -oP 'v?\K\d+\.\d+\.\d+' | head -n1 || echo "none")
+NODE_CURRENT=$(node -v 2>/dev/null | sed 's/^v//' || echo "none")
+NODE_INSTALLED_MAJOR=$(echo "$NODE_CURRENT" | grep -oE '^[0-9]+' || echo "none")
 
 echo "Pocketbase:  ${POCKETBASE_CURRENT} → ${POCKETBASE_LATEST}"
 echo "Filebrowser: ${FILEBROWSER_CURRENT} → ${FILEBROWSER_LATEST}"
 echo "Caddy:       ${CADDY_CURRENT} → latest build"
-echo ""
-read -p "Proceed with update? (y/N) " -n 1 -r
+echo "Node.js:     ${NODE_CURRENT} → latest ${NODE_MAJOR}.x"
 echo ""
 
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Aborted."
-    exit 0
+if [ -t 0 ]; then # Only run inside interactive terminals (0 = stdin)
+    read -p "Proceed? (y/N) " -n 1 -r
+    echo ""
+    [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Aborted."; exit 0; }
+fi
+
+mkdir -p /myapps/caddy /myapps/pocketbase /myapps/filebrowser /myapps/nodeapp
+
+if ! $FIRST_RUN; then
+    echo ""
+    echo "=== Stopping services ==="
+    supervisorctl stop nodeapp filebrowser pocketbase caddy
+
+    echo ""
+    echo "=== Backing up current binaries ==="
+    cp /myapps/caddy/caddy             /myapps/caddy/caddy.bak
+    cp /myapps/pocketbase/pocketbase   /myapps/pocketbase/pocketbase.bak
+    cp /myapps/filebrowser/filebrowser /myapps/filebrowser/filebrowser.bak
 fi
 
 echo ""
-echo "=== Stopping services ==="
-supervisorctl stop filebrowser 2>/dev/null || true
-supervisorctl stop pocketbase 2>/dev/null || true
-supervisorctl stop caddy 2>/dev/null || true
+echo "=== Downloading binaries ==="
 
-echo ""
-echo "=== Backing up current binaries ==="
-cp /myapps/caddy/caddy /myapps/caddy/caddy.bak
-cp /myapps/pocketbase/pocketbase /myapps/pocketbase/pocketbase.bak
-cp /myapps/filebrowser/filebrowser /myapps/filebrowser/filebrowser.bak
-
-echo ""
-echo "=== Downloading updates ==="
-
-# `set -e` would normally abort on a failed curl/wget, but we want to clean
-# up partial files and restart services first, so we capture exit codes.
+# Capture exit codes manually so we can clean up partial files before exit.
 DOWNLOAD_FAILED=0
-
 curl -fsSL -o /myapps/caddy/caddy.tmp "https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com/mholt/caddy-ratelimit" || DOWNLOAD_FAILED=1
 wget -q "https://github.com/pocketbase/pocketbase/releases/download/v${POCKETBASE_LATEST}/pocketbase_${POCKETBASE_LATEST}_linux_amd64.zip" -O /myapps/pocketbase/pocketbase.zip || DOWNLOAD_FAILED=1
 wget -q "https://github.com/filebrowser/filebrowser/releases/download/v${FILEBROWSER_LATEST}/linux-amd64-filebrowser.tar.gz" -O /myapps/filebrowser/filebrowser.tar.gz || DOWNLOAD_FAILED=1
 
 for f in /myapps/caddy/caddy.tmp /myapps/pocketbase/pocketbase.zip /myapps/filebrowser/filebrowser.tar.gz; do
-    if [ ! -s "$f" ]; then
-        DOWNLOAD_FAILED=1
-    fi
+    [ ! -s "$f" ] && DOWNLOAD_FAILED=1
 done
 
 if [ "$DOWNLOAD_FAILED" -eq 1 ]; then
-    echo "ERROR: One or more downloads failed. Aborting and restoring services." >&2
+    echo "ERROR: One or more downloads failed." >&2
     rm -f /myapps/caddy/caddy.tmp /myapps/pocketbase/pocketbase.zip /myapps/filebrowser/filebrowser.tar.gz
-    rm -f /myapps/caddy/caddy.bak /myapps/pocketbase/pocketbase.bak /myapps/filebrowser/filebrowser.bak
-    supervisorctl start caddy
-    supervisorctl start pocketbase
-    supervisorctl start filebrowser
+    if ! $FIRST_RUN; then
+        echo "Restoring previous binaries and restarting services." >&2
+        mv /myapps/caddy/caddy.bak             /myapps/caddy/caddy
+        mv /myapps/pocketbase/pocketbase.bak   /myapps/pocketbase/pocketbase
+        mv /myapps/filebrowser/filebrowser.bak /myapps/filebrowser/filebrowser
+        start_if_autostart caddy
+        start_if_autostart pocketbase
+        start_if_autostart filebrowser
+        start_if_autostart nodeapp
+    fi
+    echo "" >&2
+    echo "NOTE: Re-run after fixing: sudo bash /myapps/install-update-binaries.sh" >&2
     exit 1
 fi
 
 echo ""
-echo "=== Installing updates ==="
+echo "=== Installing binaries ==="
 
 chmod +x /myapps/caddy/caddy.tmp
 mv /myapps/caddy/caddy.tmp /myapps/caddy/caddy
@@ -165,25 +145,57 @@ rm filebrowser.tar.gz
 chmod +x filebrowser
 
 echo ""
-echo "=== Starting services ==="
-supervisorctl start caddy
-supervisorctl start pocketbase
-supervisorctl start filebrowser
+echo "=== Installing/updating Node.js ==="
+
+if [ "$NODE_INSTALLED_MAJOR" != "$NODE_MAJOR" ]; then
+    echo "Setting up Node.js ${NODE_MAJOR}.x repo (was: ${NODE_INSTALLED_MAJOR:-none})"
+    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
+    # Verify apt will actually pull the right major version. Catches both the
+    # "no sources file written" failure and any future repo-config breakage,
+    # without depending on NodeSource's chosen filename (.list vs .sources).
+    NODE_CANDIDATE=$(apt-cache policy nodejs | awk '/Candidate:/ {print $2}')
+    if ! echo "$NODE_CANDIDATE" | grep -qE "^${NODE_MAJOR}\."; then
+        echo "ERROR: nodejs candidate is '${NODE_CANDIDATE}', expected ${NODE_MAJOR}.x — NodeSource repo not active." >&2
+        exit 1
+    fi
+    apt install -y nodejs
+else
+    apt update -qq
+    apt install -y --only-upgrade nodejs
+fi
+
+echo ""
+echo "=== Registering Supervisor configs ==="
+# First-install: registers programs and auto-starts those with autostart=true.
+# Update: no-op unless a .conf changed (then picks up the change).
+supervisorctl reread
+supervisorctl update
+
+if ! $FIRST_RUN; then
+    echo ""
+    echo "=== Starting services ==="
+    start_if_autostart caddy
+    start_if_autostart pocketbase
+    start_if_autostart filebrowser
+    start_if_autostart nodeapp
+fi
 
 echo ""
 echo "=== Done ==="
 echo "Caddy:       $(/myapps/caddy/caddy version 2>/dev/null | head -1)"
 echo "Pocketbase:  $(/myapps/pocketbase/pocketbase --version 2>/dev/null)"
 echo "Filebrowser: $(/myapps/filebrowser/filebrowser version 2>/dev/null)"
+echo "Node.js:     $(node -v 2>/dev/null)"
 echo ""
-echo "Backups kept at *.bak - remove with:"
-echo "  sudo rm /myapps/caddy/caddy.bak /myapps/pocketbase/pocketbase.bak /myapps/filebrowser/filebrowser.bak"
-UPDATEEOF
-chmod +x /myapps/update-myapps.sh
+if ls /myapps/caddy/caddy.bak /myapps/pocketbase/pocketbase.bak /myapps/filebrowser/filebrowser.bak >/dev/null 2>&1; then
+    echo "Backups kept at *.bak — remove with:"
+    echo "  sudo rm /myapps/caddy/caddy.bak /myapps/pocketbase/pocketbase.bak /myapps/filebrowser/filebrowser.bak"
+fi
+BINEOF
+chmod +x /myapps/install-update-binaries.sh
 
-# Note: This heredoc uses <<EOF (not <<'EOF') so ${CUSTOM_DOMAIN} expands.
-# Caddy placeholders like {path} and {remote_host} are safe because the shell
-# only expands ${...} and $(...), not bare {braces}.
+# Caddy + Supervisor configs.
+# Unquoted heredoc: ${CUSTOM_DOMAIN}, ${NODEAPP_PORT} expand. {path}, {remote_host} are safe.
 cat > /myapps/caddy/Caddyfile <<EOF
 {
     order rate_limit before basic_auth
@@ -191,15 +203,13 @@ cat > /myapps/caddy/Caddyfile <<EOF
 
 ${CUSTOM_DOMAIN} {
     request_body {
-        max_size 10MB
+        max_size 100MB
     }
-    
-    # Filebrowser (must come before root)
+
     handle /filebrowser {
         redir {path}/ permanent
     }
     handle /filebrowser/* {
-        # Rate limit login attempts (5 per minute per IP)
         rate_limit {
             zone filebrowser_login {
                 match {
@@ -213,8 +223,14 @@ ${CUSTOM_DOMAIN} {
         }
         reverse_proxy localhost:8091
     }
-    
-    # Pocketbase
+
+    handle /nodeapp {
+        redir {path}/ permanent
+    }
+    handle /nodeapp/* {
+        reverse_proxy localhost:${NODEAPP_PORT}
+    }
+
     handle {
         reverse_proxy localhost:8090 {
             transport http {
@@ -225,65 +241,86 @@ ${CUSTOM_DOMAIN} {
 }
 EOF
 
-cat > /etc/supervisor/conf.d/caddy.conf <<'EOF'
+cat > /etc/supervisor/conf.d/caddy.conf <<EOF
 [program:caddy]
 directory=/myapps/caddy
 command=/myapps/caddy/caddy run --config /myapps/caddy/Caddyfile
 environment=XDG_DATA_HOME="/myapps/caddy/data",XDG_CONFIG_HOME="/myapps/caddy/config"
-autostart=true
+autostart=${AUTOSTART_CADDY}
 autorestart=true
 stderr_logfile=/myapps/caddy/caddy.err.log
 stdout_logfile=/myapps/caddy/caddy.out.log
-logfile_maxbytes=10MB
-logfile_backups=5
 user=root
 EOF
 
-cat > /etc/supervisor/conf.d/pocketbase.conf <<'EOF'
+cat > /etc/supervisor/conf.d/pocketbase.conf <<EOF
 [program:pocketbase]
 directory=/myapps/pocketbase
 command=/myapps/pocketbase/pocketbase serve --http=127.0.0.1:8090
-autostart=true
+autostart=${AUTOSTART_POCKETBASE}
 autorestart=true
 stderr_logfile=/myapps/pocketbase/pocketbase.err.log
 stdout_logfile=/myapps/pocketbase/pocketbase.out.log
-logfile_maxbytes=10MB
-logfile_backups=5
 user=root
 EOF
 
-cat > /etc/supervisor/conf.d/filebrowser.conf <<'EOF'
+cat > /etc/supervisor/conf.d/filebrowser.conf <<EOF
 [program:filebrowser]
 directory=/myapps/filebrowser
 command=/myapps/filebrowser/filebrowser -r /myapps -a 127.0.0.1 -p 8091 --baseurl /filebrowser
-autostart=true
+autostart=${AUTOSTART_FILEBROWSER}
 autorestart=true
 stderr_logfile=/myapps/filebrowser/filebrowser.err.log
 stdout_logfile=/myapps/filebrowser/filebrowser.out.log
-logfile_maxbytes=10MB
-logfile_backups=5
 user=root
 EOF
 
-# Configure SSH security BEFORE starting services (key-based authentication only)
-sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-sed -i 's/^#*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
-sed -i 's/^#*UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config
+# Nodeapp: starts disabled. Flip autostart to true after uploading your app.
+cat > /etc/supervisor/conf.d/nodeapp.conf <<EOF
+[program:nodeapp]
+directory=/myapps/nodeapp
+command=/usr/bin/node /myapps/nodeapp/${NODEAPP_RUN}
+environment=NODE_ENV="production",PORT="${NODEAPP_PORT}"
+autostart=${AUTOSTART_NODEAPP}
+autorestart=true
+startsecs=5
+startretries=3
+stopsignal=TERM
+stopwaitsecs=15
+stderr_logfile=/myapps/nodeapp/nodeapp.err.log
+stdout_logfile=/myapps/nodeapp/nodeapp.out.log
+user=root
+EOF
+
+# SSH: key-based auth only (drop-in survives package upgrades)
+cat > /etc/ssh/sshd_config.d/99-hardening.conf <<EOF
+PubkeyAuthentication yes
+PasswordAuthentication no
+ChallengeResponseAuthentication no
+UsePAM yes
+EOF
 systemctl restart ssh
 
-# Configure network security settings (kernel parameters)
-sed -i '/net\.ipv4\.conf\.default\.rp_filter/c\net.ipv4.conf.default.rp_filter=1' /etc/sysctl.conf
-sed -i '/net\.ipv4\.conf\.all\.rp_filter/c\net.ipv4.conf.all.rp_filter=1' /etc/sysctl.conf
-sed -i '/net\.ipv4\.conf\.all\.accept_redirects/c\net.ipv4.conf.all.accept_redirects=0' /etc/sysctl.conf
-sed -i '/net\.ipv4\.conf\.default\.accept_redirects/c\net.ipv4.conf.default.accept_redirects=0' /etc/sysctl.conf
-sed -i '/net\.ipv4\.conf\.all\.send_redirects/c\net.ipv4.conf.all.send_redirects=0' /etc/sysctl.conf
-sed -i '/net\.ipv4\.conf\.all\.log_martians/c\net.ipv4.conf.all.log_martians=1' /etc/sysctl.conf
-sysctl -p
+# Network kernel parameters (drop-in is idempotent and doesn't mutate /etc/sysctl.conf)
+cat > /etc/sysctl.d/99-hardening.conf <<EOF
+net.ipv4.conf.default.rp_filter=1
+net.ipv4.conf.all.rp_filter=1
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.all.log_martians=1
+EOF
+sysctl --system
 
-# Start services with Supervisor (Caddyfile already in place)
-supervisorctl reread
-supervisorctl update
-sleep 2
+# Install all binaries via the helper (single source of truth)
+bash /myapps/install-update-binaries.sh --first-run
 
-echo "Installation completed at $(date)" > /var/log/setup-complete.log
+# Pocketbase superuser (|| true so re-runs don't fail)
+/myapps/pocketbase/pocketbase superuser create "${POCKETBASE_EMAIL}" "${POCKETBASE_PASS}" || true
+
+mkdir -p /myapps/pocketbase/pb_public
+cat > /myapps/pocketbase/pb_public/index.html <<'EOF'
+<!DOCTYPE html><html lang="de"><head><meta charset="utf-8"></head><body><h1>Seite in Arbeit...</h1></body></html>
+EOF
+
+echo "Installation completed at $(date)"
