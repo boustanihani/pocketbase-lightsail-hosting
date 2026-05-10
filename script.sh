@@ -224,10 +224,10 @@ ${CUSTOM_DOMAIN} {
         reverse_proxy localhost:8091
     }
 
-    handle /nodeapp {
-        redir {path}/ permanent
+    handle_path /nodeapp {
+        reverse_proxy localhost:${NODEAPP_PORT}
     }
-    handle /nodeapp/* {
+    handle_path /nodeapp/* {
         reverse_proxy localhost:${NODEAPP_PORT}
     }
 
