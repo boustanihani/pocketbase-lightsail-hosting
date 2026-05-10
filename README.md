@@ -128,10 +128,10 @@ Paste the following content:
         reverse_proxy localhost:8091
     }
 
-    handle /nodeapp {
-        redir {path}/ permanent
+    handle_path /nodeapp {
+        reverse_proxy localhost:8092
     }
-    handle /nodeapp/* {
+    handle_path /nodeapp/* {
         reverse_proxy localhost:8092
     }
 
