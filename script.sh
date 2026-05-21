@@ -26,7 +26,7 @@ export DEBIAN_FRONTEND=noninteractive # Do not ask questions
 export NEEDRESTART_MODE=a # Restart systemd services if needed
 
 apt update && apt upgrade -y
-apt install -y curl jq supervisor unzip sshguard tilde btop unattended-upgrades earlyoom
+apt install -y curl jq supervisor unzip sshguard tilde btop unattended-upgrades earlyoom zram-config
 mkdir -p /myapps/caddy /myapps/pocketbase /myapps/filebrowser /myapps/nodeapp
 
 # Quoted heredoc — no var expansion
