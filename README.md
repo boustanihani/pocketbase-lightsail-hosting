@@ -82,7 +82,7 @@ Edit the script variable `CUSTOM_DOMAIN=":80"` to your domain before launch, or 
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-sudo apt install -y curl jq supervisor unzip sshguard tilde btop unattended-upgrades earlyoom
+sudo apt install -y curl jq supervisor unzip sshguard tilde btop unattended-upgrades earlyoom zram-config
 ```
 
 If you're scripting this rather than running it interactively, also `export DEBIAN_FRONTEND=noninteractive` and `export NEEDRESTART_MODE=a` first — without these, kernel-upgrade dialogs and needrestart prompts can wedge debconf and silently break later steps (notably NodeSource's setup script).
