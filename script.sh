@@ -26,7 +26,7 @@ export DEBIAN_FRONTEND=noninteractive # Do not ask questions
 export NEEDRESTART_MODE=a # Restart systemd services if needed
 
 apt update && apt upgrade -y
-apt install -y curl jq supervisor unzip sshguard tilde btop unattended-upgrades
+apt install -y curl jq supervisor unzip sshguard tilde btop unattended-upgrades earlyoom
 mkdir -p /myapps/caddy /myapps/pocketbase /myapps/filebrowser /myapps/nodeapp
 
 # Quoted heredoc — no var expansion
@@ -311,6 +311,14 @@ net.ipv4.conf.all.send_redirects=0
 net.ipv4.conf.all.log_martians=1
 EOF
 sysctl --system
+
+# OOM protection: earlyoom kills a runaway process before the box freezes.
+# --avoid keeps ssh/supervisor alive so you never lose access; --prefer biases
+# kills toward the Node app. -r 3600 keeps the default hourly memory report.
+cat > /etc/default/earlyoom <<EOF
+EARLYOOM_ARGS="-r 3600 -m 10 -s 10 --avoid '(^|/)(sshd|supervisord|systemd|sudo|bash)\$' --prefer '^node\$'"
+EOF
+systemctl restart earlyoom
 
 # Install all binaries via the helper (single source of truth)
 bash /myapps/install-update-binaries.sh --first-run
