@@ -21,6 +21,7 @@ This guide will help you host three applications on a single AWS Lightsail insta
 - Binary installation and updates share a single script (`/myapps/install-update-binaries.sh`) — the launch script invokes it for the initial install, and you re-run it later for updates
 - The launch script sets up HTTP; HTTPS is configured by simply adding your domain to the Caddyfile
 - SSHGuard is installed and active for SSH brute-force protection (no configuration needed). Note: bans are applied locally via nftables; they don't appear in the Lightsail firewall console.
+- `earlyoom` is installed and configured to kill a runaway process before the server freezes from memory exhaustion (Lightsail instances ship without swap, so the kernel's own OOM killer reacts too late). It is configured via `/etc/default/earlyoom` to avoid killing `sshd`/`supervisord` and to prefer the Node.js app.
 - Enhanced network security settings are applied for DDoS protection and security hardening
 - File upload size is limited to 100MB (configurable in Caddyfile)
 - Pocketbase has a 6-minute timeout for long-running operations
@@ -81,7 +82,7 @@ Edit the script variable `CUSTOM_DOMAIN=":80"` to your domain before launch, or 
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-sudo apt install -y curl jq supervisor unzip sshguard tilde btop unattended-upgrades
+sudo apt install -y curl jq supervisor unzip sshguard tilde btop unattended-upgrades earlyoom
 ```
 
 If you're scripting this rather than running it interactively, also `export DEBIAN_FRONTEND=noninteractive` and `export NEEDRESTART_MODE=a` first — without these, kernel-upgrade dialogs and needrestart prompts can wedge debconf and silently break later steps (notably NodeSource's setup script).
@@ -330,7 +331,46 @@ sudo sysctl net.ipv4.conf.all.log_martians
 - **Disable send redirects**: This is an application server, not a router
 - **Log Martians**: Records packets with impossible source addresses to help detect attacks
 
-### Step 14: Open Firewall Ports
+### Step 14: Configure OOM Protection (earlyoom)
+
+Lightsail Ubuntu instances ship **without swap**, so when memory runs out the kernel's built-in OOM killer reacts too late — the system can freeze for a long time and may kill the wrong process (even `sshd`, locking you out). `earlyoom` is a small userspace daemon that polls memory every second and kills a process *before* the freeze. It was installed in Step 3; here you tune it.
+
+The package enables and starts the service automatically on install, so it is already running with default settings. The default config protects nothing in particular — edit `/etc/default/earlyoom` so it never kills the processes that keep you connected and in control:
+
+```bash
+sudo tee /etc/default/earlyoom > /dev/null <<EOF
+EARLYOOM_ARGS="-r 3600 -m 10 -s 10 --avoid '(^|/)(sshd|supervisord|systemd|sudo|bash)$' --prefer '^node$'"
+EOF
+```
+
+Restart the service to apply:
+
+```bash
+sudo systemctl restart earlyoom
+```
+
+**What these settings do:**
+
+- **`-r 3600`**: Prints a memory report to the journal once an hour (the package default)
+- **`-m 10 -s 10`**: Triggers when available RAM *and* available swap both drop below 10%
+- **`--avoid`**: Never kill `sshd`, `supervisord`, `systemd`, `sudo`, or `bash` — so you keep SSH access and Supervisor keeps managing the other services
+- **`--prefer`**: When something must be killed, bias toward the Node.js app (it's the most likely source of a runaway leak, and Supervisor will restart it via `autorestart=true`)
+
+> **Note:** `/etc/default/earlyoom` is a config file owned by you, the administrator — editing it directly is the intended, upgrade-safe workflow (`dpkg` will not silently overwrite your changes). It is *not* like editing a packaged unit file.
+
+**Verify** the daemon picked up your arguments — the running command line is shown in the status output:
+
+```bash
+systemctl status earlyoom
+```
+
+To see whether `earlyoom` has ever killed anything:
+
+```bash
+journalctl -u earlyoom | grep -i kill
+```
+
+### Step 15: Open Firewall Ports
 
 1. Go to your Lightsail instance in AWS Console
 2. Click on the **Networking** tab
