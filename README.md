@@ -21,7 +21,7 @@ This guide will help you host three applications on a single AWS Lightsail insta
 - Binary installation and updates share a single script (`/myapps/install-update-binaries.sh`) — the launch script invokes it for the initial install, and you re-run it later for updates
 - The launch script sets up HTTP; HTTPS is configured by simply adding your domain to the Caddyfile
 - SSHGuard is installed and active for SSH brute-force protection (no configuration needed). Note: bans are applied locally via nftables; they don't appear in the Lightsail firewall console.
-- `earlyoom` is installed and configured to kill a runaway process before the server freezes from memory exhaustion (Lightsail instances ship without swap, so the kernel's own OOM killer reacts too late). It is configured via `/etc/default/earlyoom` to avoid killing `sshd`/`supervisord` and to prefer the Node.js app.
+- `zram-config` adds compressed in-RAM swap (the Lightsail Ubuntu image ships with no disk swap), and `earlyoom` is the last line of defense: it kills a runaway process once RAM *and* zram swap both run low, before the kernel's own OOM killer freezes the box. earlyoom is configured via `/etc/default/earlyoom` to avoid killing `sshd`/`supervisord` and to prefer the Node.js app.
 - Enhanced network security settings are applied for DDoS protection and security hardening
 - File upload size is limited to 100MB (configurable in Caddyfile)
 - Pocketbase has a 6-minute timeout for long-running operations
@@ -280,10 +280,10 @@ EOF'
 Configure SSH for key-based authentication only by adding a drop-in file (this approach doesn't mutate the upstream `/etc/ssh/sshd_config` and survives package upgrades):
 
 ```bash
-sudo tee /etc/ssh/sshd_config.d/99-hardening.conf > /dev/null <<EOF
+sudo tee /etc/ssh/sshd_config.d/00-hardening.conf > /dev/null <<EOF
 PubkeyAuthentication yes
 PasswordAuthentication no
-ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
 UsePAM yes
 EOF
 ```
@@ -295,6 +295,8 @@ sudo systemctl restart ssh
 
 **Important:** After this step, only key-based SSH authentication will work! Make sure you have your SSH keys configured.
 
+> **Why `00-` and not `99-`?** `sshd` uses **first-value-wins**: for each keyword, the first occurrence read is the one that applies. The `Include /etc/ssh/sshd_config.d/*.conf` line sits at the *top* of `sshd_config`, and the glob is read in filename order — so among drop-ins, the **lowest** number wins. `00-` makes this file authoritative over the image's own drop-ins (e.g. `60-cloudimg-settings.conf`). This is the opposite of `/etc/sysctl.d/` (Step 13), where the *last* file read wins and `99-` is the strong slot. Verify the effective values with `sudo sshd -T | grep -iE 'passwordauthentication|kbdinteractive'`.
+
 ### Step 13: Configure Network Security Settings
 
 Configure kernel network parameters for enhanced security by adding a drop-in file (idempotent and doesn't mutate `/etc/sysctl.conf`):
@@ -305,6 +307,8 @@ net.ipv4.conf.default.rp_filter=1
 net.ipv4.conf.all.rp_filter=1
 net.ipv4.conf.all.accept_redirects=0
 net.ipv4.conf.default.accept_redirects=0
+net.ipv6.conf.all.accept_redirects=0
+net.ipv6.conf.default.accept_redirects=0
 net.ipv4.conf.all.send_redirects=0
 net.ipv4.conf.all.log_martians=1
 EOF
@@ -318,6 +322,7 @@ sudo sysctl --system
 # Verify
 sudo sysctl net.ipv4.conf.all.rp_filter
 sudo sysctl net.ipv4.conf.all.accept_redirects
+sudo sysctl net.ipv6.conf.all.accept_redirects
 sudo sysctl net.ipv4.conf.all.send_redirects
 sudo sysctl net.ipv4.conf.all.log_martians
 ```
@@ -327,13 +332,13 @@ sudo sysctl net.ipv4.conf.all.log_martians
 **What these settings do:**
 
 - **Spoof protection (rp_filter)**: Validates that packets are coming from legitimate sources
-- **Disable ICMP redirects**: Prevents Man-in-the-Middle attacks via malicious route redirects
+- **Disable ICMP redirects**: Prevents Man-in-the-Middle attacks via malicious route redirects — on **both** IPv4 and IPv6, since the instance is dual-stack. (`rp_filter`, `send_redirects` and `log_martians` are IPv4-only knobs; they have no IPv6 counterpart.)
 - **Disable send redirects**: This is an application server, not a router
 - **Log Martians**: Records packets with impossible source addresses to help detect attacks
 
 ### Step 14: Configure OOM Protection (earlyoom)
 
-Lightsail Ubuntu instances ship **without swap**, so when memory runs out the kernel's built-in OOM killer reacts too late — the system can freeze for a long time and may kill the wrong process (even `sshd`, locking you out). `earlyoom` is a small userspace daemon that polls memory every second and kills a process *before* the freeze. It was installed in Step 3; here you tune it.
+The Lightsail Ubuntu image ships **without disk swap**; `zram-config` (installed in Step 3) adds compressed in-RAM swap as a first buffer against memory spikes. That softens the cliff but doesn't remove it: when memory truly runs out, the kernel's built-in OOM killer reacts too late — the system can freeze for a long time and may kill the wrong process (even `sshd`, locking you out). `earlyoom` is a small userspace daemon that polls memory every second and kills a process *before* the freeze — with the config below, once available RAM **and** zram swap both drop under 10%. It was also installed in Step 3; here you tune it.
 
 The package enables and starts the service automatically on install, so it is already running with default settings. The default config protects nothing in particular — edit `/etc/default/earlyoom` so it never kills the processes that keep you connected and in control:
 
@@ -352,7 +357,7 @@ sudo systemctl restart earlyoom
 **What these settings do:**
 
 - **`-r 3600`**: Prints a memory report to the journal once an hour (the package default)
-- **`-m 10 -s 10`**: Triggers when available RAM *and* available swap both drop below 10%
+- **`-m 10 -s 10`**: Triggers when available RAM *and* available swap both drop below 10% (swap here is the zram device from Step 3)
 - **`--avoid`**: Never kill `sshd`, `supervisord`, `systemd`, `sudo`, or `bash` — so you keep SSH access and Supervisor keeps managing the other services
 - **`--prefer`**: When something must be killed, bias toward the Node.js app (it's the most likely source of a runaway leak, and Supervisor will restart it via `autorestart=true`)
 
@@ -464,10 +469,10 @@ sudo supervisorctl restart caddy
 ### Option B: One-liner Command
 
 ```bash
-sudo sed -i 's/:80/sub.domain.ext/' /myapps/caddy/Caddyfile && sudo supervisorctl restart caddy
+sudo sed -i 's/^:80/sub.domain.ext/' /myapps/caddy/Caddyfile && sudo supervisorctl restart caddy
 ```
 
-**Important:** Replace `sub.domain.ext` with your actual domain!
+**Important:** Replace `sub.domain.ext` with your actual domain! The `^` anchor is not optional — without it, sed also rewrites the `:80` inside every `localhost:8090/8091/8092` `reverse_proxy` line and corrupts the Caddyfile. Only the site address on the first line starts at column 0.
 
 Caddy will automatically obtain SSL certificates from Let's Encrypt, configure HTTPS, redirect HTTP to HTTPS, and auto-renew certificates.
 

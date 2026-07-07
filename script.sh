@@ -293,10 +293,10 @@ user=root
 EOF
 
 # SSH: key-based auth only (drop-in survives package upgrades)
-cat > /etc/ssh/sshd_config.d/99-hardening.conf <<EOF
+cat > /etc/ssh/sshd_config.d/00-hardening.conf <<EOF
 PubkeyAuthentication yes
 PasswordAuthentication no
-ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
 UsePAM yes
 EOF
 systemctl restart ssh
@@ -307,6 +307,8 @@ net.ipv4.conf.default.rp_filter=1
 net.ipv4.conf.all.rp_filter=1
 net.ipv4.conf.all.accept_redirects=0
 net.ipv4.conf.default.accept_redirects=0
+net.ipv6.conf.all.accept_redirects=0
+net.ipv6.conf.default.accept_redirects=0
 net.ipv4.conf.all.send_redirects=0
 net.ipv4.conf.all.log_martians=1
 EOF
