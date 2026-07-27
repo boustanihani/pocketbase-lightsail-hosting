@@ -1,12 +1,6 @@
 #!/bin/bash
-#
-# AWS Lightsail launch script - Pocketbase + Filebrowser + Caddy + Node.js
-# Keep under ~12KB raw (Lightsail limits base64-encoded user-data to 16KB)
 
-# sudo cat /var/log/cloud-init-output.log
-# sudo tail -f /var/log/cloud-init-output.log (FOLLOW LIVE)
-# sudo cat /var/log/cloud-init-output.log | curl -s -F "content=<-" https://dpaste.com/api/v2/
-# sudo cat /myapps/filebrowser/filebrowser.err.log | grep -i password
+# Keep under ~12KB raw (Lightsail limits base64-encoded user-data to 16KB)
 
 AUTOSTART_CADDY=true
 AUTOSTART_FILEBROWSER=true
@@ -28,8 +22,10 @@ export NEEDRESTART_MODE=a # Restart systemd services if needed
 apt update && apt upgrade -y
 apt install -y curl jq supervisor unzip sshguard tilde btop unattended-upgrades earlyoom zram-config
 
-# Supervisor's minfds (default 1024) caps FDs for every child; SSE needs more
-sed -i '/^\[supervisord\]/a minfds=65536' /etc/supervisor/supervisord.conf
+# Supervisor children inherit its FD limit; 1024 is too low for Pocketbase SSE
+mkdir -p /etc/systemd/system/supervisor.service.d
+printf '[Service]\nLimitNOFILE=65536\n' > /etc/systemd/system/supervisor.service.d/limits.conf
+systemctl daemon-reload
 systemctl restart supervisor
 
 mkdir -p /myapps/caddy /myapps/pocketbase /myapps/filebrowser /myapps/nodeapp
@@ -87,8 +83,6 @@ if [ -t 0 ]; then # Only run inside interactive terminals (0 = stdin)
     echo ""
     [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Aborted."; exit 0; }
 fi
-
-mkdir -p /myapps/caddy /myapps/pocketbase /myapps/filebrowser /myapps/nodeapp
 
 if ! $FIRST_RUN; then
     echo ""
