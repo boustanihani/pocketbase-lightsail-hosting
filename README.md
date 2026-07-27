@@ -22,6 +22,7 @@ This guide will help you host three applications on a single AWS Lightsail insta
 - The launch script sets up HTTP; HTTPS is configured by simply adding your domain to the Caddyfile
 - SSHGuard is installed and active for SSH brute-force protection (no configuration needed). Note: bans are applied locally via nftables; they don't appear in the Lightsail firewall console.
 - `zram-config` adds compressed in-RAM swap (the Lightsail Ubuntu image ships with no disk swap), and `earlyoom` is the last line of defense: it kills a runaway process once RAM *and* zram swap both run low, before the kernel's own OOM killer freezes the box. earlyoom is configured via `/etc/default/earlyoom` to avoid killing `sshd`/`supervisord` and to prefer the Node.js app.
+- Supervisor's `minfds` is raised to `65536` so Pocketbase can hold many concurrent realtime (SSE) connections. Each open SSE subscription consumes one file descriptor for its entire lifetime, and Supervisor's default of 1024 is inherited by every child process — it overrides `ulimit` and `/etc/security/limits.conf`, so this is the only setting that reaches Pocketbase (see [Step 14](#step-14-raise-the-open-file-descriptor-limit))
 - Enhanced network security settings are applied for DDoS protection and security hardening
 - File upload size is limited to 100MB (configurable in Caddyfile)
 - Pocketbase has a 6-minute timeout for long-running operations
@@ -46,7 +47,14 @@ When creating your Lightsail instance:
 
 Under the hood, `script.sh` writes the system configuration (Caddyfile, Supervisor configs, SSH/sysctl hardening) and then invokes `/myapps/install-update-binaries.sh` to download and install Caddy, Pocketbase, Filebrowser, and Node.js. That same helper script is also what you run later to update everything — see [Updating All Binaries](#updating-all-binaries).
 
-> **Note on script size:** Keep `script.sh` under ~12KB raw. Lightsail limits user-data to 16KB *after* base64 encoding, which adds ~33% overhead. If you extend the script, watch the size.
+> **Note on script size:** Lightsail limits user-data to 16,384 bytes *after* base64 encoding, which adds ~33% overhead — so the hard ceiling for `script.sh` is **12,288 bytes raw**. The current script is ~12.2KB, leaving only about 100 bytes of headroom. Check before you paste:
+>
+> ```bash
+> wc -c script.sh              # must stay under 12288
+> base64 -w0 script.sh | wc -c # must stay under 16384
+> ```
+>
+> If you need room, the `mkdir -p /myapps/...` line inside `install-update-binaries.sh` is redundant (those directories are always created by `script.sh` before the helper runs) and is the safest line to drop.
 
 **Initial Access (HTTP):**
 - Pocketbase Public Page: `http://YOUR_IP/` (sample page: "Seite in Arbeit...")
@@ -336,7 +344,57 @@ sudo sysctl net.ipv4.conf.all.log_martians
 - **Disable send redirects**: This is an application server, not a router
 - **Log Martians**: Records packets with impossible source addresses to help detect attacks
 
-### Step 14: Configure OOM Protection (earlyoom)
+### Step 14: Raise the Open File Descriptor Limit
+
+Unix counts network connections as file descriptors, and the default soft limit is **1024**. That is fine for plain REST traffic — a request occupies a descriptor for a few milliseconds — but Pocketbase's realtime API uses Server-Sent Events, and **an SSE subscription holds one descriptor open for as long as the browser tab stays open**. A single user with three tabs is three descriptors. Once you run out you get:
+
+```
+too many open files
+```
+
+The trap here is Supervisor. Raising the limit with `ulimit -n`, `/etc/security/limits.conf`, or PAM has **no effect** on Pocketbase, because Supervisor has its own `minfds` setting that defaults to 1024 and is inherited by every process it spawns. Whatever `minfds` says is what Pocketbase, Caddy, Filebrowser, and Nodeapp get.
+
+Edit `/etc/supervisor/supervisord.conf` and add `minfds` to the `[supervisord]` section. This one-liner is idempotent — safe to re-run on an existing server:
+
+```bash
+grep -q '^minfds' /etc/supervisor/supervisord.conf || \
+  sudo sed -i '/^\[supervisord\]/a minfds=65536' /etc/supervisor/supervisord.conf
+```
+
+The result should look like this:
+
+```ini
+[supervisord]
+minfds=65536
+logfile=/var/log/supervisor/supervisord.log
+pidfile=/var/run/supervisord.pid
+childlogdir=/var/log/supervisor
+```
+
+Restart Supervisor so it re-runs `setrlimit` and re-spawns the children with the new limit:
+
+```bash
+sudo systemctl restart supervisor
+```
+
+**Verify** against the running process, not the config file — this is the only check that actually proves it worked:
+
+```bash
+# Should show 65536 in the Soft Limit column
+sudo cat /proc/$(pgrep -f 'pocketbase serve')/limits | grep -i 'open files'
+
+# How many descriptors Pocketbase is currently using
+sudo ls /proc/$(pgrep -f 'pocketbase serve')/fd | wc -l
+```
+
+**Notes:**
+
+- **Why 65536?** It comfortably covers ~10,000+ concurrent realtime connections with room for log files, sockets, and the SQLite database. Avoid `infinity` — it resolves to the kernel maximum (1,048,576) and some software allocates arrays sized to the limit at startup.
+- **No root/PAM changes needed.** Supervisor raises both the soft *and* hard limit via `setrlimit`, and it may only raise the hard limit when running as root — which it does here. So `/etc/security/limits.conf` and the systemd unit can be left alone.
+- **The kernel-wide limit is not the issue.** `fs.file-max` is derived from RAM and is already in the millions; you never need to touch it on this instance.
+- Supervisor's own docs warn that included files in `conf.d/` should only contain `[program:x]` sections, so `minfds` must go in the main `supervisord.conf` — not in a drop-in.
+
+### Step 15: Configure OOM Protection (earlyoom)
 
 The Lightsail Ubuntu image ships **without disk swap**; `zram-config` (installed in Step 3) adds compressed in-RAM swap as a first buffer against memory spikes. That softens the cliff but doesn't remove it: when memory truly runs out, the kernel's built-in OOM killer reacts too late — the system can freeze for a long time and may kill the wrong process (even `sshd`, locking you out). `earlyoom` is a small userspace daemon that polls memory every second and kills a process *before* the freeze — with the config below, once available RAM **and** zram swap both drop under 10%. It was also installed in Step 3; here you tune it.
 
@@ -375,7 +433,7 @@ To see whether `earlyoom` has ever killed anything:
 journalctl -u earlyoom | grep -i kill
 ```
 
-### Step 15: Open Firewall Ports
+### Step 16: Open Firewall Ports
 
 1. Go to your Lightsail instance in AWS Console
 2. Click on the **Networking** tab
@@ -582,6 +640,32 @@ sudo tail -f /myapps/caddy/caddy.err.log
 sudo tail -f /myapps/pocketbase/pocketbase.err.log
 sudo tail -f /myapps/filebrowser/filebrowser.err.log
 sudo tail -f /myapps/nodeapp/nodeapp.err.log
+```
+
+### Need to share the launch log?
+
+The cloud-init output is the first place to look when an instance comes up wrong. To hand the whole thing to someone else, pipe it to a paste service:
+
+```bash
+sudo cat /var/log/cloud-init-output.log
+sudo tail -f /var/log/cloud-init-output.log   # follow live
+sudo cat /var/log/cloud-init-output.log | curl -s -F "content=<-" https://dpaste.com/api/v2/
+```
+
+### "Too many open files" in the logs?
+
+The file descriptor limit is too low — see [Step 14](#step-14-raise-the-open-file-descriptor-limit). Check what the running process actually has, since the config file can lie:
+
+```bash
+sudo cat /proc/$(pgrep -f 'pocketbase serve')/limits | grep -i 'open files'
+```
+
+If the soft limit says `1024`, the `minfds` setting either isn't in `/etc/supervisor/supervisord.conf` or Supervisor wasn't restarted after the change. Note that `sudo supervisorctl restart pocketbase` is **not** enough — the limit lives on the `supervisord` parent process, so you need `sudo systemctl restart supervisor` to re-run `setrlimit` and re-spawn the children.
+
+You can also raise it on a running process without any restart at all:
+
+```bash
+sudo prlimit --pid $(pgrep -f 'pocketbase serve') --nofile=65536:65536
 ```
 
 ### Can't access via browser?
