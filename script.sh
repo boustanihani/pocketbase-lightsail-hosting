@@ -169,8 +169,7 @@ fi
 echo ""
 echo "=== Registering Supervisor configs ==="
 # First-install: registers programs and auto-starts those with autostart=true.
-# Update: no-op unless a .conf changed (then picks up the change).
-supervisorctl reread
+# Update: no-op unless a .conf changed. `update` re-reads configs itself.
 supervisorctl update
 
 if ! $FIRST_RUN; then
