@@ -84,6 +84,9 @@ if [ -t 0 ]; then # Only run inside interactive terminals (0 = stdin)
     [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Aborted."; exit 0; }
 fi
 
+# Recreate dirs so `--first-run` can repair a partially deleted /myapps.
+mkdir -p /myapps/caddy /myapps/pocketbase /myapps/filebrowser /myapps/nodeapp
+
 if ! $FIRST_RUN; then
     echo ""
     echo "=== Stopping services ==="
