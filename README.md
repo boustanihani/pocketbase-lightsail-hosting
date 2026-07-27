@@ -22,7 +22,7 @@ This guide will help you host three applications on a single AWS Lightsail insta
 - The launch script sets up HTTP; HTTPS is configured by simply adding your domain to the Caddyfile
 - SSHGuard is installed and active for SSH brute-force protection (no configuration needed). Note: bans are applied locally via nftables; they don't appear in the Lightsail firewall console.
 - `zram-config` adds compressed in-RAM swap (the Lightsail Ubuntu image ships with no disk swap), and `earlyoom` is the last line of defense: it kills a runaway process once RAM *and* zram swap both run low, before the kernel's own OOM killer freezes the box. earlyoom is configured via `/etc/default/earlyoom` to avoid killing `sshd`/`supervisord` and to prefer the Node.js app.
-- Supervisor's `minfds` is raised to `65536` so Pocketbase can hold many concurrent realtime (SSE) connections. Each open SSE subscription consumes one file descriptor for its entire lifetime, and Supervisor's default of 1024 is inherited by every child process — it overrides `ulimit` and `/etc/security/limits.conf`, so this is the only setting that reaches Pocketbase (see [Step 14](#step-14-raise-the-open-file-descriptor-limit))
+- A systemd drop-in raises Supervisor's open-file limit to `65536` so Pocketbase can hold many concurrent realtime (SSE) connections. Each open SSE subscription consumes one file descriptor for its entire lifetime, and Supervisor's children inherit their limit from the `supervisord` parent — which is why `ulimit` and `/etc/security/limits.conf` have no effect here (see [Step 14](#step-14-raise-the-open-file-descriptor-limit))
 - Enhanced network security settings are applied for DDoS protection and security hardening
 - File upload size is limited to 100MB (configurable in Caddyfile)
 - Pocketbase has a 6-minute timeout for long-running operations
@@ -54,7 +54,7 @@ Under the hood, `script.sh` writes the system configuration (Caddyfile, Supervis
 > base64 -w0 script.sh | wc -c # must stay under 16384
 > ```
 >
-> If you need room, the `mkdir -p /myapps/...` line inside `install-update-binaries.sh` is redundant (those directories are always created by `script.sh` before the helper runs) and is the safest line to drop.
+> To make room for the file-descriptor drop-in, the redundant `mkdir -p /myapps/...` line inside `install-update-binaries.sh` was removed — `script.sh` always creates those directories before the helper runs, and on update runs they already exist.
 
 **Initial Access (HTTP):**
 - Pocketbase Public Page: `http://YOUR_IP/` (sample page: "Seite in Arbeit...")
@@ -352,28 +352,22 @@ Unix counts network connections as file descriptors, and the default soft limit 
 too many open files
 ```
 
-The trap here is Supervisor. Raising the limit with `ulimit -n`, `/etc/security/limits.conf`, or PAM has **no effect** on Pocketbase, because Supervisor has its own `minfds` setting that defaults to 1024 and is inherited by every process it spawns. Whatever `minfds` says is what Pocketbase, Caddy, Filebrowser, and Nodeapp get.
+The trap here is Supervisor. Raising the limit with `ulimit -n`, `/etc/security/limits.conf`, or PAM has **no effect** on Pocketbase, because Supervisor's children inherit their file descriptor limit from the `supervisord` parent process. Whatever `supervisord` has is what Pocketbase, Caddy, Filebrowser, and Nodeapp get.
 
-Edit `/etc/supervisor/supervisord.conf` and add `minfds` to the `[supervisord]` section. This one-liner is idempotent — safe to re-run on an existing server:
-
-```bash
-grep -q '^minfds' /etc/supervisor/supervisord.conf || \
-  sudo sed -i '/^\[supervisord\]/a minfds=65536' /etc/supervisor/supervisord.conf
-```
-
-The result should look like this:
-
-```ini
-[supervisord]
-minfds=65536
-logfile=/var/log/supervisor/supervisord.log
-pidfile=/var/run/supervisord.pid
-childlogdir=/var/log/supervisor
-```
-
-Restart Supervisor so it re-runs `setrlimit` and re-spawns the children with the new limit:
+The package ships a real systemd unit (`/usr/lib/systemd/system/supervisor.service`), so the cleanest fix is a drop-in — same pattern as the SSH and sysctl hardening above, and never touched by package upgrades:
 
 ```bash
+sudo mkdir -p /etc/systemd/system/supervisor.service.d
+sudo tee /etc/systemd/system/supervisor.service.d/limits.conf > /dev/null <<EOF
+[Service]
+LimitNOFILE=65536
+EOF
+```
+
+Reload the unit definitions and restart so the children are re-spawned with the new limit:
+
+```bash
+sudo systemctl daemon-reload
 sudo systemctl restart supervisor
 ```
 
@@ -389,10 +383,11 @@ sudo ls /proc/$(pgrep -f 'pocketbase serve')/fd | wc -l
 
 **Notes:**
 
+- **Why not edit `minfds` in `/etc/supervisor/supervisord.conf`?** That works too — Supervisor's `minfds` setting (default 1024) is applied to `supervisord` at startup and inherited by children. But that file is a registered dpkg *conffile*, so modifying it means future package updates will either prompt you or quietly leave a `.dpkg-dist` file you never read. The drop-in avoids touching packaged files entirely. Use `minfds` only on systems without systemd.
+- **The two settings don't fight.** Supervisor's `set_rlimits_or_exit()` only ever *raises* the limit toward `minfds` — the code is guarded by `if (soft < min_limit)`. With the soft limit already at 65536, the default `minfds=1024` does nothing at all.
 - **Why 65536?** It comfortably covers ~10,000+ concurrent realtime connections with room for log files, sockets, and the SQLite database. Avoid `infinity` — it resolves to the kernel maximum (1,048,576) and some software allocates arrays sized to the limit at startup.
-- **No root/PAM changes needed.** Supervisor raises both the soft *and* hard limit via `setrlimit`, and it may only raise the hard limit when running as root — which it does here. So `/etc/security/limits.conf` and the systemd unit can be left alone.
+- **No root/PAM changes needed.** systemd's default hard limit for services is already 524,288, so 65536 requires no privilege escalation and no `/etc/security/limits.conf` edits.
 - **The kernel-wide limit is not the issue.** `fs.file-max` is derived from RAM and is already in the millions; you never need to touch it on this instance.
-- Supervisor's own docs warn that included files in `conf.d/` should only contain `[program:x]` sections, so `minfds` must go in the main `supervisord.conf` — not in a drop-in.
 
 ### Step 15: Configure OOM Protection (earlyoom)
 
@@ -660,7 +655,7 @@ The file descriptor limit is too low — see [Step 14](#step-14-raise-the-open-f
 sudo cat /proc/$(pgrep -f 'pocketbase serve')/limits | grep -i 'open files'
 ```
 
-If the soft limit says `1024`, the `minfds` setting either isn't in `/etc/supervisor/supervisord.conf` or Supervisor wasn't restarted after the change. Note that `sudo supervisorctl restart pocketbase` is **not** enough — the limit lives on the `supervisord` parent process, so you need `sudo systemctl restart supervisor` to re-run `setrlimit` and re-spawn the children.
+If the soft limit says `1024`, either the drop-in at `/etc/systemd/system/supervisor.service.d/limits.conf` is missing, or `systemctl daemon-reload` was never run after creating it. Note that `sudo supervisorctl restart pocketbase` is **not** enough — the limit lives on the `supervisord` parent process, so you need `sudo systemctl restart supervisor` to re-run `setrlimit` and re-spawn the children.
 
 You can also raise it on a running process without any restart at all:
 
