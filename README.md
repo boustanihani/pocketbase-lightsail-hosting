@@ -1,113 +1,83 @@
 # Hosting Pocketbase, Filebrowser, and a Node.js app on AWS Lightsail
 
+Three apps on one Lightsail instance, behind Caddy, managed by Supervisor:
+
+| App | URL | Port |
+|---|---|---|
+| Pocketbase | `http://your-ip/` | 8090 |
+| Filebrowser | `http://your-ip/filebrowser/` | 8091 |
+| Node.js app | `http://your-ip/nodeapp/` | 8092 |
+
 ## Overview
 
-This guide will help you host three applications on a single AWS Lightsail instance:
-- **Pocketbase** at: `http://your-ip/` or `https://your-domain/`
-- **Filebrowser** at: `http://your-ip/filebrowser/` or `https://your-domain/filebrowser/`
-- **Node.js app** at: `http://your-ip/nodeapp/` or `https://your-domain/nodeapp/`
+- **Pocketbase** sits at the root path. Admin UI at `/_/`.
+- **Filebrowser** manages the whole `/myapps` tree. It needs `--baseurl /filebrowser` for assets to load, and Caddy rate-limits its login to 5 attempts/minute/IP.
+- **Caddy** is a prebuilt binary including the `mholt/caddy-ratelimit` module. HTTP by default; add your domain to the Caddyfile for automatic HTTPS.
+- **Node.js** comes from NodeSource (default 22.x), not Ubuntu's outdated package.
+- **Supervisor** runs all four services as `user=root` under `/myapps`.
+- **Install and update share one script**, `/myapps/install-update-binaries.sh` — see [Installing & Updating Binaries](#installing--updating-binaries).
+- **Hardening:** SSHGuard (bans via nftables, invisible to the Lightsail console), key-only SSH, sysctl network settings, `zram-config` + `earlyoom` for memory pressure, and a raised file-descriptor limit for Pocketbase's realtime connections.
+- **Limits:** 100MB uploads, 6-minute Pocketbase timeout. Both set in the Caddyfile.
 
-**Important Notes:**
-
-- Pocketbase is served at the root path for simplest access
-- Filebrowser is configured to manage the entire `/myapps` directory (Caddy, Pocketbase, Filebrowser, and Nodeapp subdirectories)
-- Filebrowser requires the `--baseurl` flag for proper asset loading under `/filebrowser`
-- Filebrowser login is rate-limited to 5 attempts per minute per IP via Caddy
-- Caddy is installed as a prebuilt binary with the `mholt/caddy-ratelimit` module included
-- Node.js (configurable major version, default 22.x) is installed from NodeSource so Ubuntu's outdated package isn't used
-- Each service's autostart behavior is controlled by `AUTOSTART_CADDY`, `AUTOSTART_POCKETBASE`, `AUTOSTART_FILEBROWSER`, and `AUTOSTART_NODEAPP` at the top of `script.sh` — Caddy, Pocketbase, and Filebrowser default to `true`; `AUTOSTART_NODEAPP` defaults to `false` because no app code exists yet (see [Activating the Node.js App](#activating-the-nodejs-app))
-- On first install, autostart values come from the `AUTOSTART_*` variables at the top of `script.sh` (which are baked into the Supervisor configs). On later update runs, `install-update-binaries.sh` reads the `autostart` value directly from each Supervisor config in `/etc/supervisor/conf.d/`, so anything you flip there is respected without touching `script.sh`
-- All services (Caddy, Pocketbase, Filebrowser, Nodeapp) are managed via Supervisor under `/myapps`
-- Binary installation and updates share a single script (`/myapps/install-update-binaries.sh`) — the launch script invokes it for the initial install, and you re-run it later for updates
-- The launch script sets up HTTP; HTTPS is configured by simply adding your domain to the Caddyfile
-- SSHGuard is installed and active for SSH brute-force protection (no configuration needed). Note: bans are applied locally via nftables; they don't appear in the Lightsail firewall console.
-- `zram-config` adds compressed in-RAM swap (the Lightsail Ubuntu image ships with no disk swap), and `earlyoom` is the last line of defense: it kills a runaway process once RAM *and* zram swap both run low, before the kernel's own OOM killer freezes the box. earlyoom is configured via `/etc/default/earlyoom` to avoid killing `sshd`/`supervisord` and to prefer the Node.js app.
-- A systemd drop-in raises Supervisor's open-file limit to `65536` so Pocketbase can hold many concurrent realtime (SSE) connections. Each open SSE subscription consumes one file descriptor for its entire lifetime, and Supervisor's children inherit their limit from the `supervisord` parent — which is why `ulimit` and `/etc/security/limits.conf` have no effect here (see [Step 14](#step-14-raise-the-open-file-descriptor-limit))
-- Enhanced network security settings are applied for DDoS protection and security hardening
-- File upload size is limited to 100MB (configurable in Caddyfile)
-- Pocketbase has a 6-minute timeout for long-running operations
-- `btop` is installed for system resource monitoring
+Autostart is controlled by `AUTOSTART_*` at the top of `script.sh` and baked into the Supervisor configs. `AUTOSTART_NODEAPP` defaults to `false` since no app code exists yet. On later update runs the script reads `autostart` straight from `/etc/supervisor/conf.d/`, so anything you flip there is respected.
 
 ---
 
-## Quick Start (Automated)
+## Quick Start
 
 When creating your Lightsail instance:
 
-1. Go to AWS Lightsail Console
-2. Click **Create instance**
-3. Select **Linux/Unix** platform
-4. Choose **OS Only** → **Ubuntu 24.04 LTS**
-5. Scroll to **Add launch script**
-6. Copy and paste the contents of [`script.sh`](./script.sh) (in this repo)
-7. Choose your instance plan (minimum: $5/month)
-8. Click **Create instance**
-9. Wait 3–5 minutes after the instance starts.
-10. Quick Check: `sudo tail /var/log/cloud-init-output.log`
+1. **Create instance** → **Linux/Unix** → **OS Only** → **Ubuntu 24.04 LTS**
+2. Instance plan: **$5/month** or higher
+3. Under **Add launch script**, paste the contents of [`script.sh`](./script.sh)
+4. Create, then wait 3–5 minutes
+5. Check it worked: `sudo tail /var/log/cloud-init-output.log`
 
-Under the hood, `script.sh` writes the system configuration (Caddyfile, Supervisor configs, SSH/sysctl hardening) and then invokes `/myapps/install-update-binaries.sh` to download and install Caddy, Pocketbase, Filebrowser, and Node.js. That same helper script is also what you run later to update everything — see [Updating All Binaries](#updating-all-binaries).
+`script.sh` writes the configuration (Caddyfile, Supervisor configs, hardening) and then calls `/myapps/install-update-binaries.sh` to download Caddy, Pocketbase, Filebrowser, and Node.js.
 
-> **Note on script size:** Lightsail limits user-data to 16,384 bytes *after* base64 encoding, which adds ~33% overhead — so the hard ceiling for `script.sh` is **12,288 bytes raw**. The current script is ~12.2KB, leaving only about 100 bytes of headroom. Check before you paste:
+> **Script size limit.** Lightsail caps user-data at 16,384 bytes *after* base64 encoding, so the raw ceiling is **12,288 bytes**. Check before pasting:
 >
 > ```bash
-> wc -c script.sh              # must stay under 12288
-> base64 -w0 script.sh | wc -c # must stay under 16384
+> wc -c script.sh              # < 12288
+> base64 -w0 script.sh | wc -c # < 16384
 > ```
->
-> To make room for the file-descriptor drop-in, the redundant `mkdir -p /myapps/...` line inside `install-update-binaries.sh` was removed — `script.sh` always creates those directories before the helper runs, and on update runs they already exist.
 
-**Initial Access (HTTP):**
-- Pocketbase Public Page: `http://YOUR_IP/` (sample page: "Seite in Arbeit...")
-- Pocketbase Admin: `http://YOUR_IP/_/` (login with credentials from `POCKETBASE_EMAIL` and `POCKETBASE_PASS`)
-- Filebrowser: `http://YOUR_IP/filebrowser` (check `/myapps/filebrowser/filebrowser.err.log` for the initial credentials)
-- Nodeapp: not running yet — see [Activating the Node.js App](#activating-the-nodejs-app)
+**First access:**
 
-**After DNS Configuration:**
-Edit the script variable `CUSTOM_DOMAIN=":80"` to your domain before launch, or follow the "Enabling HTTPS" section below to secure your site with SSL certificates.
+| What | Where | Credentials |
+|---|---|---|
+| Pocketbase page | `http://YOUR_IP/` | — |
+| Pocketbase admin | `http://YOUR_IP/_/` | `POCKETBASE_EMAIL` / `POCKETBASE_PASS` from the script |
+| Filebrowser | `http://YOUR_IP/filebrowser` | user `admin`; password printed in `/myapps/filebrowser/filebrowser.err.log` |
+| Nodeapp | `http://YOUR_IP/nodeapp/` | not running yet — see [Activating the Node.js App](#activating-the-nodejs-app) |
+
+For HTTPS, set `CUSTOM_DOMAIN` before launch or see [Enabling HTTPS](#enabling-https).
 
 ---
 
-## Manual Installation (Step-by-Step)
+## Manual Installation
 
-### Step 1: Create Your Lightsail Instance
+What `script.sh` does, step by step, if you'd rather build it yourself.
 
-1. Go to [AWS Lightsail Console](https://lightsail.aws.amazon.com/)
-2. Click **Create instance**
-3. Select:
-   - Platform: **Linux/Unix**
-   - Blueprint: **OS Only** → **Ubuntu 24.04 LTS**
-   - Instance plan: **$5/month or higher**
-4. Name your instance (e.g., `my-apps-server`)
-5. Click **Create instance**
-6. Wait for the instance to start
+### Step 1: Create the Instance
 
-### Step 2: Connect via SSH
+Create an Ubuntu 24.04 LTS instance in the [Lightsail console](https://lightsail.aws.amazon.com/), then **Connect using SSH**.
 
-1. Click on your instance name
-2. Click **Connect using SSH** (browser-based terminal)
-
-### Step 3: Update System and Install Dependencies
+### Step 2: Install Dependencies
 
 ```bash
 sudo apt update && sudo apt upgrade -y
 sudo apt install -y curl jq supervisor unzip sshguard tilde btop unattended-upgrades earlyoom zram-config
-```
-
-If you're scripting this rather than running it interactively, also `export DEBIAN_FRONTEND=noninteractive` and `export NEEDRESTART_MODE=a` first — without these, kernel-upgrade dialogs and needrestart prompts can wedge debconf and silently break later steps (notably NodeSource's setup script).
-
-### Step 4: Create Directory Structure
-
-```bash
 sudo mkdir -p /myapps/caddy /myapps/pocketbase /myapps/filebrowser /myapps/nodeapp
 ```
 
-### Step 5: Configure Caddy
+If scripting this, `export DEBIAN_FRONTEND=noninteractive` and `export NEEDRESTART_MODE=a` first — otherwise kernel-upgrade dialogs and needrestart prompts wedge debconf and silently break later steps, notably NodeSource's installer.
+
+### Step 3: Configure Caddy
 
 ```bash
 sudo nano /myapps/caddy/Caddyfile
 ```
-
-Paste the following content:
 
 ```caddy
 {
@@ -154,15 +124,11 @@ Paste the following content:
 }
 ```
 
-Save and exit (Ctrl+X, then Y, then Enter)
+### Step 4: Configure Supervisor
 
-### Step 6: Configure Supervisor for Caddy
+One file per service in `/etc/supervisor/conf.d/`. All run as `user=root` — Caddy needs it to bind ports 80/443.
 
-```bash
-sudo nano /etc/supervisor/conf.d/caddy.conf
-```
-
-Paste this configuration:
+`caddy.conf`:
 
 ```ini
 [program:caddy]
@@ -176,15 +142,7 @@ stdout_logfile=/myapps/caddy/caddy.out.log
 user=root
 ```
 
-**Note:** Caddy needs to bind to port 80/443, which requires root. Since Supervisor runs this process as `user=root`, this works as-is.
-
-### Step 7: Configure Supervisor for Pocketbase
-
-```bash
-sudo nano /etc/supervisor/conf.d/pocketbase.conf
-```
-
-Paste this configuration:
+`pocketbase.conf`:
 
 ```ini
 [program:pocketbase]
@@ -197,13 +155,7 @@ stdout_logfile=/myapps/pocketbase/pocketbase.out.log
 user=root
 ```
 
-### Step 8: Configure Supervisor for Filebrowser
-
-```bash
-sudo nano /etc/supervisor/conf.d/filebrowser.conf
-```
-
-Paste this configuration:
+`filebrowser.conf`:
 
 ```ini
 [program:filebrowser]
@@ -216,13 +168,7 @@ stdout_logfile=/myapps/filebrowser/filebrowser.out.log
 user=root
 ```
 
-### Step 9: Configure Supervisor for Nodeapp
-
-```bash
-sudo nano /etc/supervisor/conf.d/nodeapp.conf
-```
-
-Paste this configuration:
+`nodeapp.conf` — `autostart=false` is intentional, there's no app code yet:
 
 ```ini
 [program:nodeapp]
@@ -240,52 +186,36 @@ stdout_logfile=/myapps/nodeapp/nodeapp.out.log
 user=root
 ```
 
-**Note:** `autostart=false` is intentional — there's no app code yet. You'll flip this to `true` after uploading your app (see [Activating the Node.js App](#activating-the-nodejs-app)).
+### Step 5: Install the Binaries
 
-### Step 10: Install All Binaries
-
-The install/update script content is embedded in [`script.sh`](./script.sh) — copy the heredoc between the `BINEOF` markers, save it to `/myapps/install-update-binaries.sh`, make it executable, then run it with the `--first-run` flag:
+Copy the heredoc between the `BINEOF` markers in [`script.sh`](./script.sh) to `/myapps/install-update-binaries.sh`, then:
 
 ```bash
 sudo chmod +x /myapps/install-update-binaries.sh
 sudo bash /myapps/install-update-binaries.sh --first-run
-```
-
-This downloads and installs Caddy (with the rate-limiting module), Pocketbase, Filebrowser, and Node.js, then registers the Supervisor configs (which auto-starts Caddy, Pocketbase, and Filebrowser since their `autostart=true`; Nodeapp stays stopped because its `autostart=false`).
-
-The same script is reused later for updates — without the `--first-run` flag — see [Updating All Binaries](#updating-all-binaries).
-
-Verify everything is running:
-
-```bash
 sudo supervisorctl status
 ```
 
-You should see:
-- `caddy RUNNING`
-- `pocketbase RUNNING`
-- `filebrowser RUNNING`
-- `nodeapp STOPPED`
+You should see `caddy`, `pocketbase`, and `filebrowser` as `RUNNING`, and `nodeapp` as `STOPPED`.
 
-### Step 11: Create the Pocketbase Superuser (Optional)
+### Step 6: Create the Pocketbase Superuser (Optional)
 
-You can do this now via the CLI, or later through the Admin UI:
+Do it now via CLI, or later in the Admin UI:
 
 ```bash
 sudo /myapps/pocketbase/pocketbase superuser create your-email@example.com your-password
 ```
 
-**Optional:** Create a sample public page:
+Optional sample page:
+
 ```bash
 sudo mkdir -p /myapps/pocketbase/pb_public
-sudo bash -c 'cat > /myapps/pocketbase/pb_public/index.html <<EOF
-<!DOCTYPE html><html lang="de"><head><meta charset="utf-8"></head><body><h1>Seite in Arbeit...</h1></body></html>
-EOF'
+echo '<h1>Seite in Arbeit...</h1>' | sudo tee /myapps/pocketbase/pb_public/index.html
 ```
 
-### Step 12: Configure SSH Security
+### Step 7: Harden SSH
 
-Configure SSH for key-based authentication only by adding a drop-in file (this approach doesn't mutate the upstream `/etc/ssh/sshd_config` and survives package upgrades):
+A drop-in, so `/etc/ssh/sshd_config` stays untouched and survives package upgrades:
 
 ```bash
 sudo tee /etc/ssh/sshd_config.d/00-hardening.conf > /dev/null <<EOF
@@ -294,20 +224,15 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 UsePAM yes
 EOF
-```
-
-Restart SSH to apply changes:
-```bash
 sudo systemctl restart ssh
+sudo sshd -T | grep -iE 'passwordauthentication|kbdinteractive'   # verify
 ```
 
-**Important:** After this step, only key-based SSH authentication will work! Make sure you have your SSH keys configured.
+**After this, only key-based SSH works.** Have your keys ready.
 
-> **Why `00-` and not `99-`?** `sshd` uses **first-value-wins**: for each keyword, the first occurrence read is the one that applies. The `Include /etc/ssh/sshd_config.d/*.conf` line sits at the *top* of `sshd_config`, and the glob is read in filename order — so among drop-ins, the **lowest** number wins. `00-` makes this file authoritative over the image's own drop-ins (e.g. `60-cloudimg-settings.conf`). This is the opposite of `/etc/sysctl.d/` (Step 13), where the *last* file read wins and `99-` is the strong slot. Verify the effective values with `sudo sshd -T | grep -iE 'passwordauthentication|kbdinteractive'`.
+> **Why `00-` and not `99-`?** `sshd` is first-value-wins and its `Include` sits at the top of the config, so the *lowest*-numbered drop-in wins. `00-` beats the image's own `60-cloudimg-settings.conf`. This is the opposite of `/etc/sysctl.d/`, where the last file read wins and `99-` is the strong slot.
 
-### Step 13: Configure Network Security Settings
-
-Configure kernel network parameters for enhanced security by adding a drop-in file (idempotent and doesn't mutate `/etc/sysctl.conf`):
+### Step 8: Harden the Network
 
 ```bash
 sudo tee /etc/sysctl.d/99-hardening.conf > /dev/null <<EOF
@@ -320,41 +245,21 @@ net.ipv6.conf.default.accept_redirects=0
 net.ipv4.conf.all.send_redirects=0
 net.ipv4.conf.all.log_martians=1
 EOF
-```
-
-**Apply the changes:**
-
-```bash
 sudo sysctl --system
-
-# Verify
-sudo sysctl net.ipv4.conf.all.rp_filter
-sudo sysctl net.ipv4.conf.all.accept_redirects
-sudo sysctl net.ipv6.conf.all.accept_redirects
-sudo sysctl net.ipv4.conf.all.send_redirects
-sudo sysctl net.ipv4.conf.all.log_martians
 ```
 
-> **Note:** Use `sysctl --system` (not `sysctl -p`) so the drop-in file in `/etc/sysctl.d/` is actually read — plain `-p` only reloads `/etc/sysctl.conf`.
+- **`rp_filter`** — validates packets come from plausible sources (anti-spoofing).
+- **`accept_redirects=0`** — blocks MITM via malicious ICMP route redirects, on IPv4 *and* IPv6 since the instance is dual-stack.
+- **`send_redirects=0`** — this is an app server, not a router.
+- **`log_martians`** — logs impossible source addresses.
 
-**What these settings do:**
+> Use `sysctl --system`, not `sysctl -p`. Plain `-p` only reloads `/etc/sysctl.conf` and ignores `/etc/sysctl.d/`. `rp_filter`, `send_redirects` and `log_martians` are IPv4-only knobs with no IPv6 counterpart.
 
-- **Spoof protection (rp_filter)**: Validates that packets are coming from legitimate sources
-- **Disable ICMP redirects**: Prevents Man-in-the-Middle attacks via malicious route redirects — on **both** IPv4 and IPv6, since the instance is dual-stack. (`rp_filter`, `send_redirects` and `log_martians` are IPv4-only knobs; they have no IPv6 counterpart.)
-- **Disable send redirects**: This is an application server, not a router
-- **Log Martians**: Records packets with impossible source addresses to help detect attacks
+### Step 9: Raise the File Descriptor Limit
 
-### Step 14: Raise the Open File Descriptor Limit
+Unix counts network connections as file descriptors, and the default soft limit is **1024**. Fine for REST — a request holds a descriptor for milliseconds — but Pocketbase's realtime API uses Server-Sent Events, and **an SSE subscription holds one descriptor for as long as the browser tab stays open**. Three tabs is three descriptors. Run out and you get `too many open files`.
 
-Unix counts network connections as file descriptors, and the default soft limit is **1024**. That is fine for plain REST traffic — a request occupies a descriptor for a few milliseconds — but Pocketbase's realtime API uses Server-Sent Events, and **an SSE subscription holds one descriptor open for as long as the browser tab stays open**. A single user with three tabs is three descriptors. Once you run out you get:
-
-```
-too many open files
-```
-
-The trap here is Supervisor. Raising the limit with `ulimit -n`, `/etc/security/limits.conf`, or PAM has **no effect** on Pocketbase, because Supervisor's children inherit their file descriptor limit from the `supervisord` parent process. Whatever `supervisord` has is what Pocketbase, Caddy, Filebrowser, and Nodeapp get.
-
-The package ships a real systemd unit (`/usr/lib/systemd/system/supervisor.service`), so the cleanest fix is a drop-in — same pattern as the SSH and sysctl hardening above, and never touched by package upgrades:
+The trap is Supervisor: `ulimit -n`, `/etc/security/limits.conf`, and PAM all have **no effect**, because Supervisor's children inherit their limit from the `supervisord` parent. A systemd drop-in is the fix:
 
 ```bash
 sudo mkdir -p /etc/systemd/system/supervisor.service.d
@@ -362,343 +267,212 @@ sudo tee /etc/systemd/system/supervisor.service.d/limits.conf > /dev/null <<EOF
 [Service]
 LimitNOFILE=65536
 EOF
-```
-
-Reload the unit definitions and restart so the children are re-spawned with the new limit:
-
-```bash
 sudo systemctl daemon-reload
 sudo systemctl restart supervisor
 ```
 
-**Verify** against the running process, not the config file — this is the only check that actually proves it worked:
+Verify against the running process — the config file can lie:
 
 ```bash
-# Should show 65536 in the Soft Limit column
-sudo cat /proc/$(pgrep -f 'pocketbase serve')/limits | grep -i 'open files'
-
-# How many descriptors Pocketbase is currently using
-sudo ls /proc/$(pgrep -f 'pocketbase serve')/fd | wc -l
+sudo cat /proc/$(pgrep -f 'pocketbase serve')/limits | grep -i 'open files'   # expect 65536
+sudo ls /proc/$(pgrep -f 'pocketbase serve')/fd | wc -l                       # current usage
 ```
 
-**Notes:**
+> **Why not `minfds` in `/etc/supervisor/supervisord.conf`?** It works, but that file is a registered dpkg *conffile* — editing it means future package updates either prompt you or leave a `.dpkg-dist` you never read. Use `minfds` only on systems without systemd. The two don't conflict: Supervisor only ever *raises* toward `minfds`, so its default of 1024 does nothing once the inherited limit is already 65536.
+>
+> 65536 covers 10,000+ concurrent connections with room to spare. Don't use `infinity` — it resolves to the kernel max (1,048,576) and some software allocates arrays that size at startup.
 
-- **Why not edit `minfds` in `/etc/supervisor/supervisord.conf`?** That works too — Supervisor's `minfds` setting (default 1024) is applied to `supervisord` at startup and inherited by children. But that file is a registered dpkg *conffile*, so modifying it means future package updates will either prompt you or quietly leave a `.dpkg-dist` file you never read. The drop-in avoids touching packaged files entirely. Use `minfds` only on systems without systemd.
-- **The two settings don't fight.** Supervisor's `set_rlimits_or_exit()` only ever *raises* the limit toward `minfds` — the code is guarded by `if (soft < min_limit)`. With the soft limit already at 65536, the default `minfds=1024` does nothing at all.
-- **Why 65536?** It comfortably covers ~10,000+ concurrent realtime connections with room for log files, sockets, and the SQLite database. Avoid `infinity` — it resolves to the kernel maximum (1,048,576) and some software allocates arrays sized to the limit at startup.
-- **No root/PAM changes needed.** systemd's default hard limit for services is already 524,288, so 65536 requires no privilege escalation and no `/etc/security/limits.conf` edits.
-- **The kernel-wide limit is not the issue.** `fs.file-max` is derived from RAM and is already in the millions; you never need to touch it on this instance.
+### Step 10: Configure OOM Protection
 
-### Step 15: Configure OOM Protection (earlyoom)
+The Lightsail image ships **without disk swap**. `zram-config` adds compressed in-RAM swap as a first buffer; `earlyoom` is the backstop. Without it the kernel's own OOM killer reacts too late — the box freezes for minutes and may kill `sshd`, locking you out.
 
-The Lightsail Ubuntu image ships **without disk swap**; `zram-config` (installed in Step 3) adds compressed in-RAM swap as a first buffer against memory spikes. That softens the cliff but doesn't remove it: when memory truly runs out, the kernel's built-in OOM killer reacts too late — the system can freeze for a long time and may kill the wrong process (even `sshd`, locking you out). `earlyoom` is a small userspace daemon that polls memory every second and kills a process *before* the freeze — with the config below, once available RAM **and** zram swap both drop under 10%. It was also installed in Step 3; here you tune it.
-
-The package enables and starts the service automatically on install, so it is already running with default settings. The default config protects nothing in particular — edit `/etc/default/earlyoom` so it never kills the processes that keep you connected and in control:
+The package is already running with defaults after Step 2, but its defaults protect nothing in particular:
 
 ```bash
 sudo tee /etc/default/earlyoom > /dev/null <<EOF
 EARLYOOM_ARGS="-r 3600 -m 10 -s 10 --avoid '(^|/)(sshd|supervisord|systemd|sudo|bash)$' --prefer '^node$'"
 EOF
-```
-
-Restart the service to apply:
-
-```bash
 sudo systemctl restart earlyoom
 ```
 
-**What these settings do:**
+- **`-m 10 -s 10`** — fire when available RAM *and* zram swap both drop below 10%
+- **`--avoid`** — never kill `sshd`, `supervisord`, `systemd`, `sudo`, `bash`, so you keep access and Supervisor keeps managing services
+- **`--prefer`** — bias toward the Node app; it's the likeliest leak and `autorestart=true` brings it back
+- **`-r 3600`** — hourly memory report to the journal
 
-- **`-r 3600`**: Prints a memory report to the journal once an hour (the package default)
-- **`-m 10 -s 10`**: Triggers when available RAM *and* available swap both drop below 10% (swap here is the zram device from Step 3)
-- **`--avoid`**: Never kill `sshd`, `supervisord`, `systemd`, `sudo`, or `bash` — so you keep SSH access and Supervisor keeps managing the other services
-- **`--prefer`**: When something must be killed, bias toward the Node.js app (it's the most likely source of a runaway leak, and Supervisor will restart it via `autorestart=true`)
+Check with `systemctl status earlyoom` (the running args are shown) and `journalctl -u earlyoom | grep -i kill`.
 
-> **Note:** `/etc/default/earlyoom` is a config file owned by you, the administrator — editing it directly is the intended, upgrade-safe workflow (`dpkg` will not silently overwrite your changes). It is *not* like editing a packaged unit file.
+`/etc/default/earlyoom` is yours to edit — dpkg won't overwrite it.
 
-**Verify** the daemon picked up your arguments — the running command line is shown in the status output:
+### Step 11: Open Firewall Ports
 
-```bash
-systemctl status earlyoom
-```
+Lightsail gives each instance **two independent firewalls** — one for IPv4, one for IPv6 — and rules must be added to each separately. IPv6 is on by default for instances created since January 2021, so your instance is dual-stack and Caddy is already listening on both; only the console firewall stands in the way.
 
-To see whether `earlyoom` has ever killed anything:
+In the Lightsail console → your instance → **Networking**:
 
-```bash
-journalctl -u earlyoom | grep -i kill
-```
+| Firewall | Open |
+|---|---|
+| IPv4 | TCP **22**, **80**, **443** |
+| IPv6 | TCP **80**, **443** (and **22** if you want SSH over IPv6) |
 
-### Step 16: Open Firewall Ports
-
-1. Go to your Lightsail instance in AWS Console
-2. Click on the **Networking** tab
-3. Under **IPv4 Firewall**, ensure these ports are open:
-   - **SSH** (TCP 22)
-   - **HTTP** (TCP 80)
-   - **HTTPS** (TCP 443)
-4. Click **Save** if you made any changes
+The IPv6 table only appears once IPv6 is enabled for the instance, in the **IPv6 Networking** section on the same page. Leaving port 22 closed on IPv6 is a reasonable choice — it halves the surface exposed to scanners — but **80 and 443 should be open on both**, or IPv6-only clients simply can't reach you.
 
 ---
 
 ## Activating the Node.js App
 
-The launch script installs Node.js and prepares a Supervisor entry for `nodeapp`, but the service starts disabled (`autostart=false`) because there's no app code yet. Here's how to deploy your app:
+`nodeapp` ships stopped because there's no code yet.
 
-### Step 1: Upload Your App Code
+**1. Upload.** Put your files in `/myapps/nodeapp/` via Filebrowser or `scp`. You need at least `index.js`; add `package.json` if you have dependencies. Supervisor sets `PORT=8092`, so listen on `process.env.PORT` — Caddy proxies `/nodeapp/*` there.
 
-Open Filebrowser at `http://YOUR_IP/filebrowser` and upload your app files into `/myapps/nodeapp/`. At minimum you need an `index.js` (the entry point referenced in the Supervisor config). If your app has dependencies, also upload `package.json` (and optionally `package-lock.json`).
-
-The included Supervisor config expects:
-- Entry point: `/myapps/nodeapp/index.js`
-- App listens on `127.0.0.1:8092` (Caddy proxies `/nodeapp/*` to this port)
-
-The `PORT` environment variable is set to `8092` by Supervisor, so use `process.env.PORT` in your code.
-
-### Step 2: Install Dependencies (If Any)
-
-If your app uses npm packages, SSH in and install them:
+**2. Install dependencies**, if any:
 
 ```bash
-cd /myapps/nodeapp
-sudo npm install --omit=dev
+cd /myapps/nodeapp && sudo npm install --omit=dev
 ```
 
-`--omit=dev` skips dev dependencies, which you don't want on a production server.
-
-### Step 3: Enable Autostart
-
-Edit the Supervisor config and flip `autostart` to `true`:
+**3. Enable and start:**
 
 ```bash
 sudo sed -i 's/^autostart=false/autostart=true/' /etc/supervisor/conf.d/nodeapp.conf
-```
-
-Then tell Supervisor to pick up the change and start the service:
-
-```bash
-sudo supervisorctl reread
 sudo supervisorctl update
 sudo supervisorctl start nodeapp
 ```
 
-### Step 4: Verify
+**4. Verify:**
 
 ```bash
-sudo supervisorctl status nodeapp        # should say RUNNING
-curl http://127.0.0.1:8092/              # direct hit on the app
-curl http://127.0.0.1/nodeapp/           # through Caddy
-sudo tail -f /myapps/nodeapp/nodeapp.err.log
+sudo supervisorctl status nodeapp   # RUNNING
+curl http://127.0.0.1:8092/         # direct
+curl http://127.0.0.1/nodeapp/      # through Caddy
 ```
 
-If something's wrong, check the error log first — Node uncaught exceptions land there.
-
-### Updating Your App Code
-
-Upload new files via Filebrowser (or `scp`), then restart:
-
-```bash
-sudo supervisorctl restart nodeapp
-```
-
-If you changed dependencies (`package.json`), run `sudo npm install --omit=dev` in `/myapps/nodeapp/` before restarting.
+To deploy new code later: upload, then `sudo supervisorctl restart nodeapp`. Re-run `npm install --omit=dev` first if dependencies changed.
 
 ---
 
-## Enabling HTTPS (After DNS is Configured)
+## Enabling HTTPS
 
-Once your domain is pointing to your instance:
-
-### Option A: Quick Edit in SSH
-
-```bash
-sudo nano /myapps/caddy/Caddyfile
-```
-
-Replace `:80` with your domain (e.g., `sub.domain.ext`), save and reload:
-```bash
-sudo supervisorctl restart caddy
-```
-
-### Option B: One-liner Command
+Once your domain points at the instance, replace `:80` in the Caddyfile with your domain:
 
 ```bash
 sudo sed -i 's/^:80/sub.domain.ext/' /myapps/caddy/Caddyfile && sudo supervisorctl restart caddy
 ```
 
-**Important:** Replace `sub.domain.ext` with your actual domain! The `^` anchor is not optional — without it, sed also rewrites the `:80` inside every `localhost:8090/8091/8092` `reverse_proxy` line and corrupts the Caddyfile. Only the site address on the first line starts at column 0.
+**The `^` anchor is not optional.** Without it, sed also rewrites the `:80` inside `localhost:8090/8091/8092` and corrupts the file. Only the site address starts at column 0.
 
-Caddy will automatically obtain SSL certificates from Let's Encrypt, configure HTTPS, redirect HTTP to HTTPS, and auto-renew certificates.
+Caddy then obtains a Let's Encrypt certificate, redirects HTTP to HTTPS, and auto-renews.
 
 ---
 
-## Supervisor Quick Reference
+## Installing & Updating Binaries
 
-### Managing Applications
+`/myapps/install-update-binaries.sh` has two modes.
 
-```bash
-sudo supervisorctl status
-
-sudo supervisorctl start caddy
-sudo supervisorctl start pocketbase
-sudo supervisorctl start filebrowser
-sudo supervisorctl start nodeapp
-
-sudo supervisorctl stop caddy
-sudo supervisorctl stop pocketbase
-sudo supervisorctl stop filebrowser
-sudo supervisorctl stop nodeapp
-
-sudo supervisorctl restart caddy
-sudo supervisorctl restart pocketbase
-sudo supervisorctl restart filebrowser
-sudo supervisorctl restart nodeapp
-
-sudo tail -f /myapps/caddy/caddy.err.log
-sudo tail -f /myapps/pocketbase/pocketbase.err.log
-sudo tail -f /myapps/filebrowser/filebrowser.err.log
-sudo tail -f /myapps/nodeapp/nodeapp.err.log
-```
-
-### Updating All Binaries
-
-The same script that performs the initial install (`/myapps/install-update-binaries.sh`, content embedded in [`script.sh`](./script.sh) between the `BINEOF` markers) is also used for updates. The first install is invoked with `--first-run` (which skips the stop/backup/restart logic since nothing is running yet); for updates, run it without the flag. Update mode stops the services, backs up current binaries, downloads the latest versions of Caddy, Pocketbase, Filebrowser, and Node.js (within the configured `NODE_MAJOR` line), validates the downloads, and restarts each service whose Supervisor config has `autostart=true`.
+**Update** (no flag) — the normal case. Stops the services, backs up the current binaries to `*.bak`, downloads the latest Caddy, Pocketbase, Filebrowser, and Node.js (within `NODE_MAJOR`), validates the downloads, and restarts each service whose Supervisor config says `autostart=true`:
 
 ```bash
 sudo bash /myapps/install-update-binaries.sh
 ```
 
-Services with `autostart=false` are left stopped after the update — only their binaries are refreshed. This applies uniformly to all four services, so e.g. flipping Pocketbase to `autostart=false` and re-running the script will update Pocketbase's binary without starting it.
+If a download fails it restores the `.bak` binaries and restarts, so a broken network leaves you where you started.
+
+**Install / repair** (`--first-run`) — skips the stop, backup, and restart logic, recreates any missing `/myapps/*` directories, and downloads straight into them. `script.sh` uses this for the initial install, and it's also how you rebuild a service you deliberately deleted:
+
+```bash
+sudo rm -rf /myapps/pocketbase          # e.g. wipe the database and start over
+sudo bash /myapps/install-update-binaries.sh --first-run
+```
+
+Note that plain update mode will *not* repair this — it aborts at the backup step when the binary is missing, which is deliberate: an update should fail loudly rather than silently turn into a fresh install. Also note the script itself lives in `/myapps`, so `rm -rf /myapps` removes your ability to run it.
+
+Services with `autostart=false` have their binaries refreshed but stay stopped. That applies to all four, so setting Pocketbase to `autostart=false` updates it without starting it.
 
 ---
 
-## Default Credentials
+## Supervisor Quick Reference
 
-**Pocketbase Admin:**
-- URL: `http://YOUR_IP/_/` or `https://YOUR_DOMAIN/_/`
-- Email: Set via `POCKETBASE_EMAIL` in launch script (or created manually)
-- Password: Set via `POCKETBASE_PASS` in launch script (or created manually)
+```bash
+sudo supervisorctl status                       # all services
+sudo supervisorctl restart pocketbase           # or caddy | filebrowser | nodeapp
+sudo supervisorctl stop all
+sudo supervisorctl update                       # after editing a .conf
+```
 
-**Filebrowser:**
-- URL: `http://YOUR_IP/filebrowser` or `https://YOUR_DOMAIN/filebrowser`
-- Default username: `admin`
-- First-time credentials are shown in: `/myapps/filebrowser/filebrowser.err.log`
+`update` re-reads the configs itself, so `reread` beforehand is redundant — both call the same reload internally. Run `reread` on its own only as a dry run: it reports what changed without applying anything.
 
-**Nodeapp:**
-- No default credentials — your app handles its own auth (or doesn't, depending on what you build).
+Logs live next to each binary as `<name>.err.log` and `<name>.out.log`:
+
+```bash
+sudo tail -f /myapps/pocketbase/pocketbase.err.log
+```
 
 ---
 
 ## Directory Structure
 
-After installation, your directory structure will look like:
-
 ```
 /myapps/
-├── install-update-binaries.sh (install/update script for all binaries)
+├── install-update-binaries.sh
 ├── caddy/
-│   ├── caddy (executable, prebuilt with rate limiting module)
+│   ├── caddy                  (prebuilt, with rate-limit module)
 │   ├── Caddyfile
-│   ├── data/caddy/ (certificates, OCSP staples)
-│   ├── config/caddy/ (autosaved config)
-│   ├── caddy.err.log
-│   └── caddy.out.log
+│   ├── data/caddy/            (certificates, OCSP staples)
+│   └── config/caddy/          (autosaved config)
 ├── pocketbase/
-│   ├── pocketbase (executable)
-│   ├── pb_data/
-│   ├── pb_public/
-│   │   └── index.html (sample page)
-│   ├── pocketbase.err.log
-│   └── pocketbase.out.log
+│   ├── pocketbase
+│   ├── pb_data/               (database)
+│   └── pb_public/             (static files served at /)
 ├── filebrowser/
-│   ├── filebrowser (executable)
-│   ├── filebrowser.db
-│   ├── filebrowser.out.log
-│   └── filebrowser.err.log
+│   ├── filebrowser
+│   └── filebrowser.db
 └── nodeapp/
-    ├── index.js (your code, uploaded via Filebrowser)
-    ├── package.json (if your app has dependencies)
-    ├── node_modules/ (created by `npm install`)
-    ├── nodeapp.err.log
-    └── nodeapp.out.log
+    ├── index.js               (your code)
+    ├── package.json
+    └── node_modules/
 ```
 
-**Note:** Filebrowser is configured to show and manage the entire `/myapps` directory.
+Each directory also holds that service's `.err.log` and `.out.log`. Filebrowser shows and manages this entire tree.
 
 ---
 
 ## Troubleshooting
 
-### Applications not starting?
-```bash
-sudo supervisorctl status
-sudo tail -f /myapps/caddy/caddy.err.log
-sudo tail -f /myapps/pocketbase/pocketbase.err.log
-sudo tail -f /myapps/filebrowser/filebrowser.err.log
-sudo tail -f /myapps/nodeapp/nodeapp.err.log
-```
+**Something won't start** — `sudo supervisorctl status`, then read that service's `.err.log`.
 
-### Need to share the launch log?
+**Can't reach it in a browser** — check the Lightsail firewall (80/443 open), then `sudo supervisorctl status caddy` and its error log.
 
-The cloud-init output is the first place to look when an instance comes up wrong. To hand the whole thing to someone else, pipe it to a paste service:
+**Pocketbase admin won't load** — the URL is `http://YOUR_IP/_/`, with the underscore and trailing slash.
 
-```bash
-sudo cat /var/log/cloud-init-output.log
-sudo tail -f /var/log/cloud-init-output.log   # follow live
-sudo cat /var/log/cloud-init-output.log | curl -s -F "content=<-" https://dpaste.com/api/v2/
-```
+**Nodeapp won't start**
+- `autostart=true` in `/etc/supervisor/conf.d/nodeapp.conf`, followed by `sudo supervisorctl update`
+- `/myapps/nodeapp/index.js` exists
+- the app listens on `process.env.PORT` (8092), not `0.0.0.0` or another port
+- `node_modules/` present — `cd /myapps/nodeapp && sudo npm install --omit=dev`
 
-### "Too many open files" in the logs?
+**Nodeapp returns 502** — Caddy is proxying to a process that isn't running. Check `supervisorctl status nodeapp` and its error log.
 
-The file descriptor limit is too low — see [Step 14](#step-14-raise-the-open-file-descriptor-limit). Check what the running process actually has, since the config file can lie:
+**`too many open files`** — the descriptor limit, see [Step 9](#step-9-raise-the-file-descriptor-limit).
 
 ```bash
 sudo cat /proc/$(pgrep -f 'pocketbase serve')/limits | grep -i 'open files'
 ```
 
-If the soft limit says `1024`, either the drop-in at `/etc/systemd/system/supervisor.service.d/limits.conf` is missing, or `systemctl daemon-reload` was never run after creating it. Note that `sudo supervisorctl restart pocketbase` is **not** enough — the limit lives on the `supervisord` parent process, so you need `sudo systemctl restart supervisor` to re-run `setrlimit` and re-spawn the children.
-
-You can also raise it on a running process without any restart at all:
+If it says `1024`, the drop-in is missing or `systemctl daemon-reload` was never run. `supervisorctl restart pocketbase` is **not** enough — the limit lives on the `supervisord` parent, so you need `sudo systemctl restart supervisor`. To fix a live process without restarting anything:
 
 ```bash
 sudo prlimit --pid $(pgrep -f 'pocketbase serve') --nofile=65536:65536
 ```
 
-### Can't access via browser?
-1. Check firewall rules in Lightsail (port 80 and 443 must be open)
-2. Check Caddy status: `sudo supervisorctl status caddy`
-3. Check Caddy logs: `sudo tail -50 /myapps/caddy/caddy.err.log`
+**Caddy can't get a certificate**
+- Ports 80 and 443 open in the Lightsail firewall — **on both the IPv4 and IPv6 tables**. If your domain has an AAAA record, Let's Encrypt prefers IPv6 for validation, so a closed IPv6 firewall fails issuance even though the site loads perfectly over IPv4. The Caddy log makes this look like a DNS problem.
+- DNS resolves to the instance *before* Caddy tries: `nslookup sub.domain.ext`
+- If you set the domain too early, wait for propagation then `sudo supervisorctl restart caddy`
+- Validate the config: `/myapps/caddy/caddy validate --config /myapps/caddy/Caddyfile`
 
-### Pocketbase Admin UI not loading?
-- Make sure to access: `http://YOUR_IP/_/` (note the trailing slash and underscore)
-- Check that Pocketbase is running: `sudo supervisorctl status pocketbase`
+**Reading the launch log**
 
-### Nodeapp won't start?
-- Confirm `autostart=true` in `/etc/supervisor/conf.d/nodeapp.conf`, then `sudo supervisorctl reread && sudo supervisorctl update`
-- Confirm `index.js` exists at `/myapps/nodeapp/index.js`
-- Check that the app listens on `127.0.0.1:8092` (or `process.env.PORT`), not on `0.0.0.0` or some other port — Caddy expects 8092
-- Check the error log: `sudo tail -50 /myapps/nodeapp/nodeapp.err.log`
-- If your app has dependencies and `node_modules/` is missing, run `cd /myapps/nodeapp && sudo npm install --omit=dev`
-
-### Nodeapp returns 502 Bad Gateway?
-- The app is registered with Caddy but isn't actually running. Check `sudo supervisorctl status nodeapp` and the error log.
-
-### HTTPS Issues
-
-#### Caddy can't obtain certificate
-- Make sure port 443 is open in your Lightsail firewall
-- Ensure your domain is pointing to your instance: `nslookup <sub.domain.ext>`
-- Check Caddy logs: `sudo tail -100 /myapps/caddy/caddy.err.log`
-- DNS must be configured and propagated BEFORE Caddy can obtain a certificate
-- If you configured the domain before DNS was ready, wait for propagation then run `sudo supervisorctl restart caddy`
-
-#### Certificate verification failed
-- Your domain DNS is not configured correctly
-- Wait a few minutes for DNS propagation
-- Verify: `nslookup <sub.domain.ext>` returns your instance IP
-
-#### Caddy fails to start
-- Check for typos in domain names in the Caddyfile
-- Validate config: `/myapps/caddy/caddy validate --config /myapps/caddy/Caddyfile`
-- Check Caddy logs: `sudo tail -50 /myapps/caddy/caddy.err.log`
-
----
+```bash
+sudo tail -f /var/log/cloud-init-output.log
+sudo cat /var/log/cloud-init-output.log | curl -s -F "content=<-" https://dpaste.com/api/v2/
+```
