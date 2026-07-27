@@ -27,6 +27,11 @@ export NEEDRESTART_MODE=a # Restart systemd services if needed
 
 apt update && apt upgrade -y
 apt install -y curl jq supervisor unzip sshguard tilde btop unattended-upgrades earlyoom zram-config
+
+# Supervisor's minfds (default 1024) caps FDs for every child; SSE needs more
+sed -i '/^\[supervisord\]/a minfds=65536' /etc/supervisor/supervisord.conf
+systemctl restart supervisor
+
 mkdir -p /myapps/caddy /myapps/pocketbase /myapps/filebrowser /myapps/nodeapp
 
 # Quoted heredoc — no var expansion
