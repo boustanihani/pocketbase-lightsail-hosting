@@ -37,17 +37,18 @@ cat > /myapps/install-update-binaries.sh <<'BINEOF'
 set -eo pipefail
 
 NODE_MAJOR=22
+FILEBROWSER_MAJOR=2
 
 # --first-run is passed by script.sh on initial install.
-# In that mode we skip stop/backup/restart logic since there's nothing running yet.
+# In that mode we skip stop/backup logic since there's nothing running yet.
 FIRST_RUN=false
 [ "$1" = "--first-run" ] && FIRST_RUN=true
 
-# Start a Supervisor program only if its config has autostart=true.
+# Start a Supervisor program if its config has autostart=true and it isn't up yet.
 start_if_autostart() {
     local prog="$1" conf="/etc/supervisor/conf.d/$1.conf"
     if [ -f "$conf" ] && grep -qE '^autostart\s*=\s*true\s*$' "$conf"; then
-        supervisorctl start "$prog"
+        [[ $(supervisorctl status "$prog") =~ RUNNING|STARTING ]] || supervisorctl start "$prog"
     else
         echo "($prog skipped — autostart not true)"
     fi
@@ -56,7 +57,8 @@ start_if_autostart() {
 echo "=== Fetching latest versions ==="
 
 POCKETBASE_LATEST=$(curl -s https://api.github.com/repos/pocketbase/pocketbase/releases/latest | jq -r '.tag_name | ltrimstr("v")')
-FILEBROWSER_LATEST=$(curl -s https://api.github.com/repos/filebrowser/filebrowser/releases/latest | jq -r '.tag_name | ltrimstr("v")')
+# Newest vN.x.y-stable (betas aren't marked prerelease).
+FILEBROWSER_LATEST=$(curl -s "https://api.github.com/repos/gtsteffaniak/filebrowser/releases?per_page=100" | jq -r '.[].tag_name' | grep -E "^v${FILEBROWSER_MAJOR}\.[0-9]+\.[0-9]+-stable$" | sort -V | tail -n1 | sed 's/^v//' || true)
 
 if [ -z "$POCKETBASE_LATEST" ] || [ "$POCKETBASE_LATEST" = "null" ]; then
     echo "ERROR: Failed to fetch Pocketbase version. Aborting." >&2; exit 1
@@ -65,7 +67,7 @@ if [ -z "$FILEBROWSER_LATEST" ] || [ "$FILEBROWSER_LATEST" = "null" ]; then
     echo "ERROR: Failed to fetch Filebrowser version. Aborting." >&2; exit 1
 fi
 
-# X.Y.Z semver match, first hit only (filebrowser appends a commit hash).
+# X.Y.Z semver match, first hit only (filebrowser prints it twice).
 POCKETBASE_CURRENT=$(/myapps/pocketbase/pocketbase --version 2>/dev/null | grep -oP 'v?\K\d+\.\d+\.\d+' | head -n1 || echo "none")
 FILEBROWSER_CURRENT=$(/myapps/filebrowser/filebrowser version 2>/dev/null | grep -oP 'v?\K\d+\.\d+\.\d+' | head -n1 || echo "none")
 CADDY_CURRENT=$(/myapps/caddy/caddy version 2>/dev/null | grep -oP 'v?\K\d+\.\d+\.\d+' | head -n1 || echo "none")
@@ -106,15 +108,15 @@ echo "=== Downloading binaries ==="
 DOWNLOAD_FAILED=0
 curl -fsSL -o /myapps/caddy/caddy.tmp "https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com/mholt/caddy-ratelimit" || DOWNLOAD_FAILED=1
 wget -q "https://github.com/pocketbase/pocketbase/releases/download/v${POCKETBASE_LATEST}/pocketbase_${POCKETBASE_LATEST}_linux_amd64.zip" -O /myapps/pocketbase/pocketbase.zip || DOWNLOAD_FAILED=1
-wget -q "https://github.com/filebrowser/filebrowser/releases/download/v${FILEBROWSER_LATEST}/linux-amd64-filebrowser.tar.gz" -O /myapps/filebrowser/filebrowser.tar.gz || DOWNLOAD_FAILED=1
+wget -q "https://github.com/gtsteffaniak/filebrowser/releases/download/v${FILEBROWSER_LATEST}/linux-amd64-filebrowser" -O /myapps/filebrowser/filebrowser.tmp || DOWNLOAD_FAILED=1
 
-for f in /myapps/caddy/caddy.tmp /myapps/pocketbase/pocketbase.zip /myapps/filebrowser/filebrowser.tar.gz; do
+for f in /myapps/caddy/caddy.tmp /myapps/pocketbase/pocketbase.zip /myapps/filebrowser/filebrowser.tmp; do
     [ ! -s "$f" ] && DOWNLOAD_FAILED=1
 done
 
 if [ "$DOWNLOAD_FAILED" -eq 1 ]; then
     echo "ERROR: One or more downloads failed." >&2
-    rm -f /myapps/caddy/caddy.tmp /myapps/pocketbase/pocketbase.zip /myapps/filebrowser/filebrowser.tar.gz
+    rm -f /myapps/caddy/caddy.tmp /myapps/pocketbase/pocketbase.zip /myapps/filebrowser/filebrowser.tmp
     if ! $FIRST_RUN; then
         echo "Restoring previous binaries and restarting services." >&2
         mv /myapps/caddy/caddy.bak             /myapps/caddy/caddy
@@ -126,7 +128,7 @@ if [ "$DOWNLOAD_FAILED" -eq 1 ]; then
         start_if_autostart nodeapp
     fi
     echo "" >&2
-    echo "NOTE: Re-run after fixing: sudo bash /myapps/install-update-binaries.sh" >&2
+    echo "NOTE: Re-run after fixing: sudo bash /myapps/install-update-binaries.sh $1" >&2
     exit 1
 fi
 
@@ -141,10 +143,8 @@ unzip -qo pocketbase.zip pocketbase
 rm pocketbase.zip
 chmod +x pocketbase
 
-cd /myapps/filebrowser
-tar -xzf filebrowser.tar.gz filebrowser
-rm filebrowser.tar.gz
-chmod +x filebrowser
+chmod +x /myapps/filebrowser/filebrowser.tmp
+mv /myapps/filebrowser/filebrowser.tmp /myapps/filebrowser/filebrowser
 
 echo ""
 echo "=== Installing/updating Node.js ==="
@@ -168,24 +168,22 @@ fi
 
 echo ""
 echo "=== Registering Supervisor configs ==="
-# First-install: registers programs and auto-starts those with autostart=true.
+# First-install: registers programs. The starts below also cover ones that failed early.
 # Update: no-op unless a .conf changed. `update` re-reads configs itself.
 supervisorctl update
 
-if ! $FIRST_RUN; then
-    echo ""
-    echo "=== Starting services ==="
-    start_if_autostart caddy
-    start_if_autostart pocketbase
-    start_if_autostart filebrowser
-    start_if_autostart nodeapp
-fi
+echo ""
+echo "=== Starting services ==="
+start_if_autostart caddy
+start_if_autostart pocketbase
+start_if_autostart filebrowser
+start_if_autostart nodeapp
 
 echo ""
 echo "=== Done ==="
 echo "Caddy:       $(/myapps/caddy/caddy version 2>/dev/null | head -1)"
 echo "Pocketbase:  $(/myapps/pocketbase/pocketbase --version 2>/dev/null)"
-echo "Filebrowser: $(/myapps/filebrowser/filebrowser version 2>/dev/null)"
+echo "Filebrowser: $(/myapps/filebrowser/filebrowser version 2>/dev/null | awk '/Version/{print $3}')"
 echo "Node.js:     $(node -v 2>/dev/null)"
 echo ""
 if ls /myapps/caddy/caddy.bak /myapps/pocketbase/pocketbase.bak /myapps/filebrowser/filebrowser.bak >/dev/null 2>&1; then
@@ -196,49 +194,38 @@ BINEOF
 chmod +x /myapps/install-update-binaries.sh
 
 # Caddy + Supervisor configs.
-# Unquoted heredoc: ${CUSTOM_DOMAIN}, ${NODEAPP_PORT} expand. {path}, {remote_host} are safe.
+# Unquoted heredoc: ${CUSTOM_DOMAIN}, ${NODEAPP_PORT} expand. {path} is safe.
 cat > /myapps/caddy/Caddyfile <<EOF
 {
-    order rate_limit before basic_auth
+	order rate_limit before basic_auth
 }
 
 ${CUSTOM_DOMAIN} {
-    request_body {
-        max_size 100MB
-    }
+	request_body {
+		max_size 100MB
+	}
 
-    handle /filebrowser {
-        redir {path}/ permanent
-    }
-    handle /filebrowser/* {
-        rate_limit {
-            zone filebrowser_login {
-                match {
-                    method POST
-                    path /filebrowser/api/login
-                }
-                key    {remote_host}
-                events 5
-                window 1m
-            }
-        }
-        reverse_proxy localhost:8091
-    }
+	handle /filebrowser {
+		redir {path}/ permanent
+	}
+	handle /filebrowser/* {
+		reverse_proxy localhost:8091
+	}
 
-    handle_path /nodeapp {
-        reverse_proxy localhost:${NODEAPP_PORT}
-    }
-    handle_path /nodeapp/* {
-        reverse_proxy localhost:${NODEAPP_PORT}
-    }
+	handle_path /nodeapp {
+		reverse_proxy localhost:${NODEAPP_PORT}
+	}
+	handle_path /nodeapp/* {
+		reverse_proxy localhost:${NODEAPP_PORT}
+	}
 
-    handle {
-        reverse_proxy localhost:8090 {
-            transport http {
-                read_timeout 360s
-            }
-        }
-    }
+	handle {
+		reverse_proxy localhost:8090 {
+			transport http {
+				read_timeout 360s
+			}
+		}
+	}
 }
 EOF
 
@@ -265,10 +252,24 @@ stdout_logfile=/myapps/pocketbase/pocketbase.out.log
 user=root
 EOF
 
+# trustProxyHeaders is only safe with listen: 127.0.0.1
+cat > /myapps/filebrowser/config.yaml <<EOF
+http:
+  port: 8091
+  listen: 127.0.0.1
+  baseURL: /filebrowser
+  trustProxyHeaders: true
+server:
+  sources:
+    - path: /myapps
+    - path: /etc/supervisor/conf.d
+      name: supervisor
+EOF
+
 cat > /etc/supervisor/conf.d/filebrowser.conf <<EOF
 [program:filebrowser]
 directory=/myapps/filebrowser
-command=/myapps/filebrowser/filebrowser -r /myapps -a 127.0.0.1 -p 8091 --baseurl /filebrowser
+command=/myapps/filebrowser/filebrowser -c /myapps/filebrowser/config.yaml
 autostart=${AUTOSTART_FILEBROWSER}
 autorestart=true
 stderr_logfile=/myapps/filebrowser/filebrowser.err.log
@@ -324,7 +325,7 @@ EOF
 systemctl restart earlyoom
 
 # Install all binaries via the helper (single source of truth)
-bash /myapps/install-update-binaries.sh --first-run
+bash /myapps/install-update-binaries.sh --first-run && RESULT=completed || RESULT="FAILED (see above)"
 
 # Pocketbase superuser (|| true so re-runs don't fail)
 /myapps/pocketbase/pocketbase superuser create "${POCKETBASE_EMAIL}" "${POCKETBASE_PASS}" || true
@@ -334,4 +335,4 @@ cat > /myapps/pocketbase/pb_public/index.html <<'EOF'
 <!DOCTYPE html><html lang="de"><head><meta charset="utf-8"></head><body><h1>Seite in Arbeit...</h1></body></html>
 EOF
 
-echo "Installation completed at $(date)"
+echo "Installation ${RESULT} at $(date)"

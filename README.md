@@ -11,8 +11,8 @@ Three apps on one Lightsail instance, behind Caddy, managed by Supervisor:
 ## Overview
 
 - **Pocketbase** sits at the root path. Admin UI at `/_/`.
-- **Filebrowser** manages the whole `/myapps` tree. It needs `--baseurl /filebrowser` for assets to load, and Caddy rate-limits its login to 5 attempts/minute/IP.
-- **Caddy** is a prebuilt binary including the `mholt/caddy-ratelimit` module. HTTP by default; add your domain to the Caddyfile for automatic HTTPS.
+- **Filebrowser** is [FileBrowser Quantum](https://github.com/gtsteffaniak/filebrowser), the maintained fork of the now-archived original. It shows two sources — the whole `/myapps` tree and `/etc/supervisor/conf.d/` — and rate-limits its own login: 10 attempts/minute per IP and per username, with a 15-minute lockout after 8 failures in a row.
+- **Caddy** is a prebuilt binary including the `mholt/caddy-ratelimit` module. Nothing uses it right now — Filebrowser limits itself — but it's ready for other endpoints. HTTP by default; add your domain to the Caddyfile for automatic HTTPS.
 - **Node.js** comes from NodeSource (default 22.x), not Ubuntu's outdated package.
 - **Supervisor** runs all four services as `user=root` under `/myapps`.
 - **Install and update share one script**, `/myapps/install-update-binaries.sh` — see [Installing & Updating Binaries](#installing--updating-binaries).
@@ -31,9 +31,11 @@ When creating your Lightsail instance:
 2. Instance plan: **$5/month** or higher
 3. Under **Add launch script**, paste the contents of [`script.sh`](./script.sh)
 4. Create, then wait 3–5 minutes
-5. Check it worked: `sudo tail /var/log/cloud-init-output.log`
+5. Check it worked: `sudo tail /var/log/cloud-init-output.log` should end with `Installation completed`
 
-`script.sh` writes the configuration (Caddyfile, Supervisor configs, hardening) and then calls `/myapps/install-update-binaries.sh` to download Caddy, Pocketbase, Filebrowser, and Node.js.
+If it ends with `Installation FAILED (see above)` instead, the cause is a few lines up. Fix it, run `sudo bash /myapps/install-update-binaries.sh --first-run`, then create the Pocketbase superuser ([Step 6](#step-6-create-the-pocketbase-superuser-optional)) — `script.sh` couldn't if the Pocketbase binary was missing.
+
+`script.sh` writes the configuration (Caddyfile, Supervisor and Filebrowser configs, hardening) and then calls `/myapps/install-update-binaries.sh` to download Caddy, Pocketbase, Filebrowser, and Node.js.
 
 > **Script size limit.** Lightsail caps user-data at 16,384 bytes *after* base64 encoding, so the raw ceiling is **12,288 bytes**. Check before pasting:
 >
@@ -41,6 +43,8 @@ When creating your Lightsail instance:
 > wc -c script.sh              # < 12288
 > base64 -w0 script.sh | wc -c # < 16384
 > ```
+>
+> The Caddyfile inside `script.sh` is indented with tabs — the format `caddy fmt` produces, so Caddy starts without a formatting warning, and about 110 bytes smaller than spaces. Keep the tabs when editing.
 
 **First access:**
 
@@ -48,8 +52,10 @@ When creating your Lightsail instance:
 |---|---|---|
 | Pocketbase page | `http://YOUR_IP/` | — |
 | Pocketbase admin | `http://YOUR_IP/_/` | `POCKETBASE_EMAIL` / `POCKETBASE_PASS` from the script |
-| Filebrowser | `http://YOUR_IP/filebrowser` | user `admin`; password printed in `/myapps/filebrowser/filebrowser.err.log` |
+| Filebrowser | `http://YOUR_IP/filebrowser` | user `admin`; one-time password printed in `/myapps/filebrowser/filebrowser.out.log`, changed at first login |
 | Nodeapp | `http://YOUR_IP/nodeapp/` | not running yet — see [Activating the Node.js App](#activating-the-nodejs-app) |
+
+Find the Filebrowser password with `sudo grep 'admin password' /myapps/filebrowser/filebrowser.out.log`. The `ffmpeg` and `cacheDir` warnings in the same log are harmless: there are just no video thumbnails, and the 20 GB free-space recommendation doesn't fit a small instance.
 
 For HTTPS, set `CUSTOM_DOMAIN` before launch or see [Enabling HTTPS](#enabling-https).
 
@@ -93,17 +99,6 @@ sudo nano /myapps/caddy/Caddyfile
         redir {path}/ permanent
     }
     handle /filebrowser/* {
-        rate_limit {
-            zone filebrowser_login {
-                match {
-                    method POST
-                    path /filebrowser/api/login
-                }
-                key    {remote_host}
-                events 5
-                window 1m
-            }
-        }
         reverse_proxy localhost:8091
     }
 
@@ -123,6 +118,8 @@ sudo nano /myapps/caddy/Caddyfile
     }
 }
 ```
+
+The `order rate_limit` line is unused for now — Filebrowser rate-limits its own login — but it lets you drop a `rate_limit` block into any route later.
 
 ### Step 4: Configure Supervisor
 
@@ -160,13 +157,34 @@ user=root
 ```ini
 [program:filebrowser]
 directory=/myapps/filebrowser
-command=/myapps/filebrowser/filebrowser -r /myapps -a 127.0.0.1 -p 8091 --baseurl /filebrowser
+command=/myapps/filebrowser/filebrowser -c /myapps/filebrowser/config.yaml
 autostart=true
 autorestart=true
 stderr_logfile=/myapps/filebrowser/filebrowser.err.log
 stdout_logfile=/myapps/filebrowser/filebrowser.out.log
 user=root
 ```
+
+Filebrowser takes no flags for port, base URL, or sources — everything lives in `/myapps/filebrowser/config.yaml`:
+
+```yaml
+http:
+  port: 8091
+  listen: 127.0.0.1
+  baseURL: /filebrowser
+  trustProxyHeaders: true
+server:
+  sources:
+    - path: /myapps
+    - path: /etc/supervisor/conf.d
+      name: supervisor
+```
+
+- **`baseURL`** — Filebrowser is served under `/filebrowser/`, so its pages, assets, and API need the prefix.
+- **`trustProxyHeaders` and `listen: 127.0.0.1` go together.** Behind Caddy every request arrives from `127.0.0.1`, so without trusting `X-Forwarded-For` the login rate limit would treat all visitors as one client — eight wrong passwords from anyone would lock `admin` out for everybody. Trusting that header is only safe because Filebrowser listens on localhost only, out of reach of remote clients, and Caddy replaces any `X-Forwarded-For` a client sends.
+- **`name: supervisor`** — the source's label in the sidebar; it would otherwise read `conf.d`.
+
+Its database (`filebrowser.sqlite`) and cache (`tmp/`) are created in the working directory, `/myapps/filebrowser`.
 
 `nodeapp.conf` — `autostart=false` is intentional, there's no app code yet:
 
@@ -369,7 +387,7 @@ Caddy then obtains a Let's Encrypt certificate, redirects HTTP to HTTPS, and aut
 
 `/myapps/install-update-binaries.sh` has two modes.
 
-**Update** (no flag) — the normal case. Stops the services, backs up the current binaries to `*.bak`, downloads the latest Caddy, Pocketbase, Filebrowser, and Node.js (within `NODE_MAJOR`), validates the downloads, and restarts each service whose Supervisor config says `autostart=true`:
+**Update** (no flag) — the normal case. Stops the services, backs up the current binaries to `*.bak`, downloads the latest Caddy and Pocketbase, the newest stable Filebrowser within `FILEBROWSER_MAJOR`, and the latest Node.js within `NODE_MAJOR`, validates the downloads, and restarts each service whose Supervisor config says `autostart=true`:
 
 ```bash
 sudo bash /myapps/install-update-binaries.sh
@@ -377,14 +395,27 @@ sudo bash /myapps/install-update-binaries.sh
 
 If a download fails it restores the `.bak` binaries and restarts, so a broken network leaves you where you started.
 
-**Install / repair** (`--first-run`) — skips the stop, backup, and restart logic, recreates any missing `/myapps/*` directories, and downloads straight into them. `script.sh` uses this for the initial install, and it's also how you rebuild a service you deliberately deleted:
+> **Why pin Filebrowser's major version?** Its betas are published as regular GitHub releases, not pre-releases, so `releases/latest` can't be trusted to mean stable — the script picks the newest `v2.x.y-stable` tag instead. And major versions need manual migrations (v1 → v2 replaced the database), so moving to v3 should be a deliberate edit of `FILEBROWSER_MAJOR`, not a side effect of an update.
+
+**Install / repair** (`--first-run`) — skips the stop and backup logic, recreates any missing `/myapps/*` directories, downloads straight into them, then starts every `autostart=true` service that isn't running yet. `script.sh` uses this for the initial install, and it's also how you rebuild a service you deliberately deleted:
 
 ```bash
+sudo supervisorctl stop pocketbase      # or it keeps running on the deleted files
 sudo rm -rf /myapps/pocketbase          # e.g. wipe the database and start over
 sudo bash /myapps/install-update-binaries.sh --first-run
 ```
 
+> **Why start services on a first run, too?** On a fresh instance Supervisor reads the new configs while the binaries are still downloading. It tries to start them, fails, and gives up after about seven seconds, leaving them `FATAL`. `supervisorctl update` sees no config change and leaves them there, so the script starts every `autostart=true` service that isn't already running.
+
 Note that plain update mode will *not* repair this — it aborts at the backup step when the binary is missing, which is deliberate: an update should fail loudly rather than silently turn into a fresh install. Also note the script itself lives in `/myapps`, so `rm -rf /myapps` removes your ability to run it.
+
+Don't do this to `/myapps/filebrowser`: its `config.yaml` is written by `script.sh`, not by this script. To reset Filebrowser, delete just its database — on the next start it creates a fresh `admin` and logs a new one-time password:
+
+```bash
+sudo supervisorctl stop filebrowser
+sudo rm /myapps/filebrowser/filebrowser.sqlite*
+sudo supervisorctl start filebrowser
+```
 
 Services with `autostart=false` have their binaries refreshed but stay stopped. That applies to all four, so setting Pocketbase to `autostart=false` updates it without starting it.
 
@@ -425,14 +456,16 @@ sudo tail -f /myapps/pocketbase/pocketbase.err.log
 │   └── pb_public/             (static files served at /)
 ├── filebrowser/
 │   ├── filebrowser
-│   └── filebrowser.db
+│   ├── config.yaml
+│   ├── filebrowser.sqlite     (users, settings, shares)
+│   └── tmp/                   (cache and search index)
 └── nodeapp/
     ├── index.js               (your code)
     ├── package.json
     └── node_modules/
 ```
 
-Each directory also holds that service's `.err.log` and `.out.log`. Filebrowser shows and manages this entire tree.
+Each directory also holds that service's `.err.log` and `.out.log`. Filebrowser shows and manages this entire tree, plus `/etc/supervisor/conf.d/` as a second source named `supervisor`.
 
 ---
 
@@ -443,6 +476,16 @@ Each directory also holds that service's `.err.log` and `.out.log`. Filebrowser 
 **Can't reach it in a browser** — check the Lightsail firewall (80/443 open), then `sudo supervisorctl status caddy` and its error log.
 
 **Pocketbase admin won't load** — the URL is `http://YOUR_IP/_/`, with the underscore and trailing slash.
+
+**Filebrowser login answers 429** — its built-in rate limit. Too many attempts within a minute clear after a few seconds; 8 wrong passwords in a row lock that IP out of that account for 15 minutes. The counters live in memory, so `sudo supervisorctl restart filebrowser` clears them at once.
+
+**Forgot the Filebrowser password** — set a new one from the shell (it prompts for the password). Stop the service first: a running Filebrowser keeps users cached and won't see the change. If `admin` never replaced its one-time password, the next login still asks for a new one.
+
+```bash
+sudo supervisorctl stop filebrowser
+cd /myapps/filebrowser && sudo ./filebrowser -c config.yaml user set admin --password
+sudo supervisorctl start filebrowser
+```
 
 **Nodeapp won't start**
 - `autostart=true` in `/etc/supervisor/conf.d/nodeapp.conf`, followed by `sudo supervisorctl update`
