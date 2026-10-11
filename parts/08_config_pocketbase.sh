@@ -22,7 +22,7 @@
 #
 # Start over with an empty database (deletes all data!):
 #   sudo supervisorctl stop pocketbase && sudo rm -rf /myapps/pocketbase
-#   sudo bash /myapps/setup/06_install_or_update_binaries.sh --first-run
+#   sudo bash /myapps/setup/06_install_or_update_binaries.sh --reinstall
 #   sudo bash /myapps/setup/08_config_pocketbase.sh
 
 source "$(dirname "$0")/common.sh"

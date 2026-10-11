@@ -3,7 +3,7 @@
 #
 #   sudo bash /myapps/setup/06_install_or_update_binaries.sh
 #
-# Install mode (a fresh server, or --first-run): downloads straight into
+# Install mode (a fresh server, or --reinstall): downloads straight into
 # /myapps/*; there's nothing to stop or back up yet. The services are set up
 # and started by 07–10.
 #
@@ -27,7 +27,7 @@
 # into a fresh install. Ask for install mode explicitly:
 #   sudo supervisorctl stop pocketbase      # or it keeps running on the deleted files
 #   sudo rm -rf /myapps/pocketbase          # e.g. wipe the database and start over
-#   sudo bash /myapps/setup/06_install_or_update_binaries.sh --first-run
+#   sudo bash /myapps/setup/06_install_or_update_binaries.sh --reinstall
 #   sudo bash /myapps/setup/08_config_pocketbase.sh    # superuser + sample page
 
 source "$(dirname "$0")/common.sh"
@@ -36,17 +36,17 @@ PROGRAMS=(caddy pocketbase filebrowser nodeapp)
 BINARIES=(/myapps/caddy/caddy /myapps/pocketbase/pocketbase /myapps/filebrowser/filebrowser)
 
 # Install mode if asked for, or if none of the binaries exists yet.
-FIRST_RUN=true
+INSTALL_MODE=true
 for bin in "${BINARIES[@]}"; do
-    [ -e "$bin" ] && FIRST_RUN=false
+    [ -e "$bin" ] && INSTALL_MODE=false
 done
-[ "${1:-}" = "--first-run" ] && FIRST_RUN=true
+[ "${1:-}" = "--reinstall" ] && INSTALL_MODE=true
 
-if ! $FIRST_RUN; then
+if ! $INSTALL_MODE; then
     for bin in "${BINARIES[@]}"; do
         if [ ! -e "$bin" ]; then
             echo "ERROR: $bin is missing. To reinstall it, run:" >&2
-            echo "  sudo bash $SETUP_DIR/06_install_or_update_binaries.sh --first-run" >&2
+            echo "  sudo bash $SETUP_DIR/06_install_or_update_binaries.sh --reinstall" >&2
             exit 1
         fi
     done
@@ -54,7 +54,7 @@ fi
 
 echo "=== Fetching latest versions ==="
 
-POCKETBASE_LATEST=$(curl -s https://api.github.com/repos/pocketbase/pocketbase/releases/latest | jq -r '.tag_name | ltrimstr("v")')
+POCKETBASE_LATEST=$(curl -s https://api.github.com/repos/pocketbase/pocketbase/releases/latest | jq -r '.tag_name | ltrimstr("v")' || true)
 # Newest vN.x.y-stable (betas aren't marked prerelease).
 FILEBROWSER_LATEST=$(curl -s "https://api.github.com/repos/gtsteffaniak/filebrowser/releases?per_page=100" | jq -r '.[].tag_name' | grep -E "^v${FILEBROWSER_MAJOR}\.[0-9]+\.[0-9]+-stable$" | sort -V | tail -n1 | sed 's/^v//' || true)
 
@@ -78,7 +78,7 @@ echo "Caddy:       ${CADDY_CURRENT} → latest build"
 echo "Node.js:     ${NODE_CURRENT} → latest ${NODE_MAJOR}.x"
 echo ""
 
-if ! $FIRST_RUN && [ -t 0 ]; then # Only ask in interactive terminals (0 = stdin)
+if ! $INSTALL_MODE && [ -t 0 ]; then # Only ask in interactive terminals (0 = stdin)
     read -p "Proceed? (y/N) " -n 1 -r
     echo ""
     [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Aborted."; exit 0; }
@@ -93,7 +93,7 @@ for prog in "${PROGRAMS[@]}"; do
     [ -f "/etc/supervisor/conf.d/$prog.conf" ] && REGISTERED+=("$prog")
 done
 
-if ! $FIRST_RUN; then
+if ! $INSTALL_MODE; then
     echo ""
     echo "=== Stopping services ==="
     for prog in "${REGISTERED[@]}"; do
@@ -125,7 +125,7 @@ done
 if [ "$DOWNLOAD_FAILED" -eq 1 ]; then
     echo "ERROR: One or more downloads failed." >&2
     rm -f /myapps/caddy/caddy.tmp /myapps/pocketbase/pocketbase.zip /myapps/filebrowser/filebrowser.tmp
-    if ! $FIRST_RUN; then
+    if ! $INSTALL_MODE; then
         echo "Restoring previous binaries and restarting services." >&2
         for bin in "${BINARIES[@]}"; do
             mv "$bin.bak" "$bin"
