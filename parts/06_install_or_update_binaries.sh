@@ -176,12 +176,15 @@ fi
 
 echo ""
 echo "=== Starting services ==="
-if [ ${#REGISTERED[@]} -eq 0 ]; then
-    echo "(None set up yet; 07–10 do that.)"
+# Not in install mode: a service's settings may be gone too (say, after
+# deleting /myapps), and 07–10 write them before starting it.
+if $INSTALL_MODE || [ ${#REGISTERED[@]} -eq 0 ]; then
+    echo "(07–10 set up and start them.)"
+else
+    for prog in "${REGISTERED[@]}"; do
+        start_if_autostart "$prog"
+    done
 fi
-for prog in "${REGISTERED[@]}"; do
-    start_if_autostart "$prog"
-done
 
 echo ""
 echo "=== Done ==="
