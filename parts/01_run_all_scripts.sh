@@ -51,17 +51,14 @@ configure() {
 }
 
 # Asks for one setting until the answer is valid. ENTER keeps the current value.
+# For the password, "random" stands for empty, which means a random one.
 ask() {
-    local var=$1 current=${!1} answer error hint=random
+    local var=$1 current=${!1} answer error hint=${!1}
+    [[ $var == *_PASS ]] && hint=${current:-random}
     while true; do
-        if [[ $var == *_PASS ]]; then
-            [ -n "$current" ] && hint="as in 00_config.cfg"
-            read -rsp "$var [$hint]: " answer
-            echo
-        else
-            read -rp "$var [$current]: " answer
-        fi
+        read -rp "$var [$hint]: " answer
         answer=${answer:-$current}
+        [[ $var == *_PASS && $answer == random ]] && answer=
         error=$(check "$var" "$answer" "$current") && break
         echo "  ✗ $error"
     done
@@ -74,7 +71,7 @@ check() {
     local var=$1 value=$2 current=$3 unsafe='[[:space:]"$`\\]'
     if [[ $var == *_PASS ]]; then
         if [ -n "$value" ] && [ ${#value} -lt 8 ]; then
-            echo "At least 8 characters, or empty for a random one."
+            echo "At least 8 characters, or random."
             return 1
         fi
         return 0
@@ -101,13 +98,7 @@ confirm() {
     echo
     echo "Your settings:"
     for var in "${SETTINGS[@]}"; do
-        if [[ $var != *_PASS ]]; then
-            printf '  %-22s %s\n' "$var" "${!var}"
-        elif [ -n "${!var}" ]; then
-            printf '  %-22s %s\n' "$var" "(set)"
-        else
-            printf '  %-22s %s\n' "$var" "(random)"
-        fi
+        printf '  %-22s %s\n' "$var" "${!var:-(random)}"   # only the password may be empty
     done
     echo
     while true; do

@@ -12,10 +12,11 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # 01's step-by-step setup hands over the password in the environment, since it
-# never writes it to the file. Everything else comes from the file.
-pass_from_env=${POCKETBASE_PASS:-}
+# never writes it to the file. Handed over, it counts even when empty (= random).
+# Everything else comes from the file.
+[[ -v POCKETBASE_PASS ]] && pass_from_env=$POCKETBASE_PASS
 source "$CONFIG"
-POCKETBASE_PASS=${pass_from_env:-$POCKETBASE_PASS}
+[[ -v pass_from_env ]] && POCKETBASE_PASS=$pass_from_env
 unset pass_from_env
 
 # apt without questions: debconf and needrestart take their defaults, changed
