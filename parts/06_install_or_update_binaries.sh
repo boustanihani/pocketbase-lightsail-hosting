@@ -9,14 +9,18 @@
 # Update mode (the normal case afterwards): shows the versions and asks
 # before going on (only in a terminal). Everything that needs the network
 # happens while the services keep running: first Node.js (the latest within
-# NODE_MAJOR, from NodeSource), then the latest Caddy and Pocketbase and the
-# newest stable Filebrowser within FILEBROWSER_MAJOR, downloaded next to the
-# old binaries as *.new. If any of that fails, the services keep running on
-# their current versions. Only then comes the swap, a few seconds of
-# downtime: the old binaries are kept as *.bak, the services stop, the new
-# binaries move into place, and each service whose Supervisor config says
-# autostart=true starts again. Services with autostart=false get the new
-# binary but stay stopped.
+# NODE_MAJOR, from NodeSource), then the latest Pocketbase and the newest
+# stable Filebrowser within FILEBROWSER_MAJOR, downloaded next to the old
+# binaries as *.new, and Caddy too if there's a new version. If any of that
+# fails, the services keep running on their current versions. Only then
+# comes the swap, a few seconds of downtime: the old binaries are kept as
+# *.bak, the services stop, the new binaries move into place, and each
+# service whose Supervisor config says autostart=true starts again. Services
+# with autostart=false get the new binary but stay stopped.
+#
+# Why Caddy only when there's a new version? caddyserver.com builds it with
+# the rate-limit module on request, which takes a while and sometimes doesn't
+# answer at all. Every download gives up after 5 minutes without a result.
 #
 # A service that won't start with its new version doesn't keep the others
 # down: they start anyway, and the end of the output names it. Its .err.log
@@ -70,10 +74,15 @@ fi
 
 echo "=== Fetching latest versions ==="
 
-pocketbase_latest=$(curl -s https://api.github.com/repos/pocketbase/pocketbase/releases/latest | jq -r '.tag_name | ltrimstr("v")' || true)
+caddy_latest=$(curl -s --max-time 30 https://api.github.com/repos/caddyserver/caddy/releases/latest | jq -r '.tag_name | ltrimstr("v")' || true)
+pocketbase_latest=$(curl -s --max-time 30 https://api.github.com/repos/pocketbase/pocketbase/releases/latest | jq -r '.tag_name | ltrimstr("v")' || true)
 # Newest vN.x.y-stable (betas aren't marked prerelease).
-filebrowser_latest=$(curl -s "https://api.github.com/repos/gtsteffaniak/filebrowser/releases?per_page=100" | jq -r '.[].tag_name' | grep -E "^v${FILEBROWSER_MAJOR}\.[0-9]+\.[0-9]+-stable$" | sort -V | tail -n1 | sed 's/^v//' || true)
+filebrowser_latest=$(curl -s --max-time 30 "https://api.github.com/repos/gtsteffaniak/filebrowser/releases?per_page=100" | jq -r '.[].tag_name' | grep -E "^v${FILEBROWSER_MAJOR}\.[0-9]+\.[0-9]+-stable$" | sort -V | tail -n1 | sed 's/^v//' || true)
 
+if [ -z "$caddy_latest" ] || [ "$caddy_latest" = "null" ]; then
+    echo "ERROR: Couldn't get Caddy's latest version from GitHub." >&2
+    exit 1
+fi
 if [ -z "$pocketbase_latest" ] || [ "$pocketbase_latest" = "null" ]; then
     echo "ERROR: Couldn't get Pocketbase's latest version from GitHub." >&2
     exit 1
@@ -90,7 +99,7 @@ node_current=$(version_of node -v)
 
 echo "Pocketbase:  $pocketbase_current → $pocketbase_latest"
 echo "Filebrowser: $filebrowser_current → ${filebrowser_latest%-stable}"
-echo "Caddy:       $caddy_current → latest build"
+echo "Caddy:       $caddy_current → $caddy_latest"
 echo "Node.js:     $node_current → latest $NODE_MAJOR.x"
 
 if ! $install_mode && [ -t 0 ]; then    # only asks in a terminal
@@ -131,11 +140,19 @@ fi
 echo
 echo "=== Downloading ==="
 # Next to the old binaries as *.new, while the services keep running.
+NEW_FILES=(/myapps/caddy/caddy.new /myapps/pocketbase/pocketbase.zip
+    /myapps/pocketbase/pocketbase.new /myapps/filebrowser/filebrowser.new)
+
+# download WHAT URL FILE: says what it loads. Fails on an error, an empty
+# file, or after 5 minutes without a result.
+download() {
+    echo "$1 …"
+    curl -fsSL --connect-timeout 30 --max-time 300 -o "$3" "$2" && [ -s "$3" ]
+}
 
 # Removes what was downloaded so far, and stops.
 download_failed() {
-    rm -f /myapps/caddy/caddy.new /myapps/pocketbase/pocketbase.zip \
-        /myapps/pocketbase/pocketbase.new /myapps/filebrowser/filebrowser.new
+    rm -f "${NEW_FILES[@]}"
     echo "ERROR: Download failed (see above). The services keep running on their current versions." >&2
     echo "Run this again once that's fixed: $RUN_AGAIN" >&2
     exit 1
@@ -143,18 +160,23 @@ download_failed() {
 
 # Recreate dirs so we can repair a partially deleted /myapps.
 mkdir -p /myapps/caddy /myapps/pocketbase /myapps/filebrowser /myapps/nodeapp
+rm -f "${NEW_FILES[@]}"    # leftovers of an interrupted run
 
-curl -fsSL -o /myapps/caddy/caddy.new \
-    "https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com/mholt/caddy-ratelimit" || download_failed
-curl -fsSL -o /myapps/pocketbase/pocketbase.zip \
-    "https://github.com/pocketbase/pocketbase/releases/download/v$pocketbase_latest/pocketbase_${pocketbase_latest}_linux_amd64.zip" || download_failed
+if [ "$caddy_current" != "$caddy_latest" ]; then
+    download "Caddy $caddy_latest (built by caddyserver.com, can take a few minutes)" \
+        "https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com/mholt/caddy-ratelimit" \
+        /myapps/caddy/caddy.new || download_failed
+else
+    echo "Caddy $caddy_current is the latest version and stays."
+fi
+download "Pocketbase $pocketbase_latest" \
+    "https://github.com/pocketbase/pocketbase/releases/download/v$pocketbase_latest/pocketbase_${pocketbase_latest}_linux_amd64.zip" \
+    /myapps/pocketbase/pocketbase.zip || download_failed
 unzip -p /myapps/pocketbase/pocketbase.zip pocketbase > /myapps/pocketbase/pocketbase.new || download_failed
 rm /myapps/pocketbase/pocketbase.zip
-curl -fsSL -o /myapps/filebrowser/filebrowser.new \
-    "https://github.com/gtsteffaniak/filebrowser/releases/download/v$filebrowser_latest/linux-amd64-filebrowser" || download_failed
-for bin in "${BINARIES[@]}"; do
-    [ -s "$bin.new" ] || download_failed    # an empty download counts as failed
-done
+download "Filebrowser ${filebrowser_latest%-stable}" \
+    "https://github.com/gtsteffaniak/filebrowser/releases/download/v$filebrowser_latest/linux-amd64-filebrowser" \
+    /myapps/filebrowser/filebrowser.new || download_failed
 
 echo
 echo "=== Installing ==="
@@ -164,8 +186,14 @@ for prog in "${PROGRAMS[@]}"; do
     [ -f "/etc/supervisor/conf.d/$prog.conf" ] && registered+=("$prog")
 done
 
+# Only the binaries that were downloaded; Caddy may have stayed.
+new_binaries=()
+for bin in "${BINARIES[@]}"; do
+    [ -e "$bin.new" ] && new_binaries+=("$bin")
+done
+
 if ! $install_mode; then
-    for bin in "${BINARIES[@]}"; do
+    for bin in "${new_binaries[@]}"; do
         cp "$bin" "$bin.bak"
     done
     for prog in "${registered[@]}"; do
@@ -174,7 +202,7 @@ if ! $install_mode; then
         fi
     done
 fi
-for bin in "${BINARIES[@]}"; do
+for bin in "${new_binaries[@]}"; do
     chmod +x "$bin.new"
     mv "$bin.new" "$bin"
 done
@@ -198,10 +226,14 @@ echo "Caddy:       $(version_of /myapps/caddy/caddy version)"
 echo "Pocketbase:  $(version_of /myapps/pocketbase/pocketbase --version)"
 echo "Filebrowser: $(version_of /myapps/filebrowser/filebrowser version)"
 echo "Node.js:     $(version_of node -v)"
-if ls /myapps/caddy/caddy.bak /myapps/pocketbase/pocketbase.bak /myapps/filebrowser/filebrowser.bak >/dev/null 2>&1; then
+backups=()
+for bin in "${BINARIES[@]}"; do
+    [ -e "$bin.bak" ] && backups+=("$bin.bak")
+done
+if [ ${#backups[@]} -gt 0 ]; then
     echo
     echo "The previous binaries are kept as *.bak. Remove them with:"
-    echo "  sudo rm /myapps/caddy/caddy.bak /myapps/pocketbase/pocketbase.bak /myapps/filebrowser/filebrowser.bak"
+    echo "  sudo rm ${backups[*]}"
 fi
 
 if [ ${#not_started[@]} -gt 0 ]; then
