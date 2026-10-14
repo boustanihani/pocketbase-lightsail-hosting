@@ -3,18 +3,26 @@
 #
 #   sudo bash /myapps/setup/06_install_or_update_binaries.sh
 #
-# Install mode (a fresh server, or --reinstall): downloads straight into
-# /myapps/*; there's nothing to stop or back up yet. The services are set up
-# and started by 07–10.
+# Install mode (a fresh server, or --reinstall): there's nothing to stop or
+# back up yet. The services are set up and started by 07–10.
 #
 # Update mode (the normal case afterwards): shows the versions and asks
-# before going on (only in a terminal), stops the services, backs up the
-# binaries as *.bak, downloads the latest Caddy and Pocketbase, the newest
-# stable Filebrowser within FILEBROWSER_MAJOR and the latest Node.js within
-# NODE_MAJOR, then starts each service whose Supervisor config says
-# autostart=true. If a download fails it restores the *.bak binaries, so a
-# broken network leaves you where you started. Services with autostart=false
-# get the new binary but stay stopped.
+# before going on (only in a terminal). Everything that needs the network
+# happens while the services keep running: first Node.js (the latest within
+# NODE_MAJOR, from NodeSource), then the latest Caddy and Pocketbase and the
+# newest stable Filebrowser within FILEBROWSER_MAJOR, downloaded next to the
+# old binaries as *.new. If any of that fails, the services keep running on
+# their current versions. Only then comes the swap, a few seconds of
+# downtime: the old binaries are kept as *.bak, the services stop, the new
+# binaries move into place, and each service whose Supervisor config says
+# autostart=true starts again. Services with autostart=false get the new
+# binary but stay stopped.
+#
+# A service that won't start with its new version doesn't keep the others
+# down: they start anyway, and the end of the output names it. Its .err.log
+# says why. To go back to the previous version, e.g. of Caddy:
+#   sudo mv /myapps/caddy/caddy.bak /myapps/caddy/caddy
+#   sudo supervisorctl start caddy
 #
 # Why pin Filebrowser's major version? Its betas are regular GitHub releases,
 # not pre-releases, so `releases/latest` can't be trusted to mean stable —
@@ -34,15 +42,23 @@ source "$(dirname "$0")/common.sh"
 
 PROGRAMS=(caddy pocketbase filebrowser nodeapp)
 BINARIES=(/myapps/caddy/caddy /myapps/pocketbase/pocketbase /myapps/filebrowser/filebrowser)
+RUN_AGAIN="sudo bash $SETUP_DIR/06_install_or_update_binaries.sh${1:+ $1}"
+
+# The X.Y.Z in a program's version output, or "none" if it isn't installed.
+version_of() {
+    local version
+    version=$("$@" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1) || true
+    echo "${version:-none}"
+}
 
 # Install mode if asked for, or if none of the binaries exists yet.
-INSTALL_MODE=true
+install_mode=true
 for bin in "${BINARIES[@]}"; do
-    [ -e "$bin" ] && INSTALL_MODE=false
+    [ -e "$bin" ] && install_mode=false
 done
-[ "${1:-}" = "--reinstall" ] && INSTALL_MODE=true
+[ "${1:-}" = "--reinstall" ] && install_mode=true
 
-if ! $INSTALL_MODE; then
+if ! $install_mode; then
     for bin in "${BINARIES[@]}"; do
         if [ ! -e "$bin" ]; then
             echo "ERROR: $bin is missing. To reinstall it, run:" >&2
@@ -54,118 +70,56 @@ fi
 
 echo "=== Fetching latest versions ==="
 
-POCKETBASE_LATEST=$(curl -s https://api.github.com/repos/pocketbase/pocketbase/releases/latest | jq -r '.tag_name | ltrimstr("v")' || true)
+pocketbase_latest=$(curl -s https://api.github.com/repos/pocketbase/pocketbase/releases/latest | jq -r '.tag_name | ltrimstr("v")' || true)
 # Newest vN.x.y-stable (betas aren't marked prerelease).
-FILEBROWSER_LATEST=$(curl -s "https://api.github.com/repos/gtsteffaniak/filebrowser/releases?per_page=100" | jq -r '.[].tag_name' | grep -E "^v${FILEBROWSER_MAJOR}\.[0-9]+\.[0-9]+-stable$" | sort -V | tail -n1 | sed 's/^v//' || true)
+filebrowser_latest=$(curl -s "https://api.github.com/repos/gtsteffaniak/filebrowser/releases?per_page=100" | jq -r '.[].tag_name' | grep -E "^v${FILEBROWSER_MAJOR}\.[0-9]+\.[0-9]+-stable$" | sort -V | tail -n1 | sed 's/^v//' || true)
 
-if [ -z "$POCKETBASE_LATEST" ] || [ "$POCKETBASE_LATEST" = "null" ]; then
-    echo "ERROR: Failed to fetch Pocketbase version. Aborting." >&2; exit 1
+if [ -z "$pocketbase_latest" ] || [ "$pocketbase_latest" = "null" ]; then
+    echo "ERROR: Couldn't get Pocketbase's latest version from GitHub." >&2
+    exit 1
 fi
-if [ -z "$FILEBROWSER_LATEST" ] || [ "$FILEBROWSER_LATEST" = "null" ]; then
-    echo "ERROR: Failed to fetch Filebrowser version. Aborting." >&2; exit 1
-fi
-
-# X.Y.Z semver match, first hit only (filebrowser prints it twice).
-POCKETBASE_CURRENT=$(/myapps/pocketbase/pocketbase --version 2>/dev/null | grep -oP 'v?\K\d+\.\d+\.\d+' | head -n1 || echo "none")
-FILEBROWSER_CURRENT=$(/myapps/filebrowser/filebrowser version 2>/dev/null | grep -oP 'v?\K\d+\.\d+\.\d+' | head -n1 || echo "none")
-CADDY_CURRENT=$(/myapps/caddy/caddy version 2>/dev/null | grep -oP 'v?\K\d+\.\d+\.\d+' | head -n1 || echo "none")
-NODE_CURRENT=$(node -v 2>/dev/null | sed 's/^v//' || echo "none")
-NODE_INSTALLED_MAJOR=$(echo "$NODE_CURRENT" | grep -oE '^[0-9]+' || echo "none")
-
-echo "Pocketbase:  ${POCKETBASE_CURRENT} → ${POCKETBASE_LATEST}"
-echo "Filebrowser: ${FILEBROWSER_CURRENT} → ${FILEBROWSER_LATEST}"
-echo "Caddy:       ${CADDY_CURRENT} → latest build"
-echo "Node.js:     ${NODE_CURRENT} → latest ${NODE_MAJOR}.x"
-echo ""
-
-if ! $INSTALL_MODE && [ -t 0 ]; then # Only ask in interactive terminals (0 = stdin)
-    read -p "Proceed? (y/N) " -n 1 -r
-    echo ""
-    [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "Aborted."; exit 0; }
-fi
-
-# Recreate dirs so we can repair a partially deleted /myapps.
-mkdir -p /myapps/caddy /myapps/pocketbase /myapps/filebrowser /myapps/nodeapp
-
-# Only the programs 07–10 have set up; Supervisor doesn't know the others.
-REGISTERED=()
-for prog in "${PROGRAMS[@]}"; do
-    [ -f "/etc/supervisor/conf.d/$prog.conf" ] && REGISTERED+=("$prog")
-done
-
-if ! $INSTALL_MODE; then
-    echo ""
-    echo "=== Stopping services ==="
-    for prog in "${REGISTERED[@]}"; do
-        if is_up "$prog"; then
-            supervisorctl stop "$prog"
-        fi
-    done
-
-    echo ""
-    echo "=== Backing up current binaries ==="
-    for bin in "${BINARIES[@]}"; do
-        cp "$bin" "$bin.bak"
-    done
-fi
-
-echo ""
-echo "=== Downloading binaries ==="
-
-# Capture exit codes manually so we can clean up partial files before exit.
-DOWNLOAD_FAILED=0
-curl -fsSL -o /myapps/caddy/caddy.tmp "https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com/mholt/caddy-ratelimit" || DOWNLOAD_FAILED=1
-curl -fsSL -o /myapps/pocketbase/pocketbase.zip "https://github.com/pocketbase/pocketbase/releases/download/v${POCKETBASE_LATEST}/pocketbase_${POCKETBASE_LATEST}_linux_amd64.zip" || DOWNLOAD_FAILED=1
-curl -fsSL -o /myapps/filebrowser/filebrowser.tmp "https://github.com/gtsteffaniak/filebrowser/releases/download/v${FILEBROWSER_LATEST}/linux-amd64-filebrowser" || DOWNLOAD_FAILED=1
-
-for f in /myapps/caddy/caddy.tmp /myapps/pocketbase/pocketbase.zip /myapps/filebrowser/filebrowser.tmp; do
-    [ ! -s "$f" ] && DOWNLOAD_FAILED=1
-done
-
-if [ "$DOWNLOAD_FAILED" -eq 1 ]; then
-    echo "ERROR: One or more downloads failed." >&2
-    rm -f /myapps/caddy/caddy.tmp /myapps/pocketbase/pocketbase.zip /myapps/filebrowser/filebrowser.tmp
-    if ! $INSTALL_MODE; then
-        echo "Restoring previous binaries and restarting services." >&2
-        for bin in "${BINARIES[@]}"; do
-            mv "$bin.bak" "$bin"
-        done
-        for prog in "${REGISTERED[@]}"; do
-            start_if_autostart "$prog"
-        done
-    fi
-    echo "" >&2
-    echo "NOTE: Re-run after fixing: sudo bash $SETUP_DIR/06_install_or_update_binaries.sh${1:+ $1}" >&2
+if [ -z "$filebrowser_latest" ]; then
+    echo "ERROR: No stable Filebrowser $FILEBROWSER_MAJOR.x found on GitHub. Is FILEBROWSER_MAJOR in $CONFIG right?" >&2
     exit 1
 fi
 
-echo ""
-echo "=== Installing binaries ==="
+caddy_current=$(version_of /myapps/caddy/caddy version)
+pocketbase_current=$(version_of /myapps/pocketbase/pocketbase --version)
+filebrowser_current=$(version_of /myapps/filebrowser/filebrowser version)
+node_current=$(version_of node -v)
 
-chmod +x /myapps/caddy/caddy.tmp
-mv /myapps/caddy/caddy.tmp /myapps/caddy/caddy
+echo "Pocketbase:  $pocketbase_current → $pocketbase_latest"
+echo "Filebrowser: $filebrowser_current → ${filebrowser_latest%-stable}"
+echo "Caddy:       $caddy_current → latest build"
+echo "Node.js:     $node_current → latest $NODE_MAJOR.x"
 
-cd /myapps/pocketbase
-unzip -qo pocketbase.zip pocketbase
-rm pocketbase.zip
-chmod +x pocketbase
+if ! $install_mode && [ -t 0 ]; then    # only asks in a terminal
+    echo
+    read -rp "Proceed? (y/N) " answer
+    if [[ $answer != [Yy]* ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+fi
 
-chmod +x /myapps/filebrowser/filebrowser.tmp
-mv /myapps/filebrowser/filebrowser.tmp /myapps/filebrowser/filebrowser
-
-echo ""
-echo "=== Installing/updating Node.js ==="
-
-if [ "$NODE_INSTALLED_MAJOR" != "$NODE_MAJOR" ]; then
-    echo "Setting up Node.js ${NODE_MAJOR}.x repo (was: ${NODE_INSTALLED_MAJOR:-none})"
-    # pipefail catches it if NodeSource's script bails out (e.g. on debconf).
-    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
+echo
+echo "=== Node.js ==="
+# needrestart would restart Supervisor, and with it every service, when
+# Node.js changes under the running Node app. The services are restarted
+# further down anyway.
+export NEEDRESTART_SUSPEND=1
+if [ "${node_current%%.*}" != "$NODE_MAJOR" ]; then    # 26.11.1 → 26
+    echo "Setting up NodeSource's repository for Node.js $NODE_MAJOR.x (was: $node_current)"
+    if ! curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -; then
+        echo "ERROR: Couldn't set up Node.js $NODE_MAJOR.x (see above). Is NODE_MAJOR in $CONFIG right?" >&2
+        exit 1
+    fi
     # Verify apt will actually pull the right major version. Catches both the
     # "no sources file written" failure and any future repo-config breakage,
     # without depending on NodeSource's chosen filename (.list vs .sources).
-    NODE_CANDIDATE=$(apt-cache policy nodejs | awk '/Candidate:/ {print $2}')
-    if ! echo "$NODE_CANDIDATE" | grep -qE "^${NODE_MAJOR}\."; then
-        echo "ERROR: nodejs candidate is '${NODE_CANDIDATE}', expected ${NODE_MAJOR}.x — NodeSource repo not active." >&2
+    candidate=$(apt-cache policy nodejs | awk '/Candidate:/ {print $2}')
+    if [[ $candidate != "$NODE_MAJOR".* ]]; then
+        echo "ERROR: apt would install nodejs '$candidate', not $NODE_MAJOR.x — NodeSource's repository isn't active." >&2
         exit 1
     fi
     apt_get install nodejs
@@ -174,26 +128,88 @@ else
     apt_get install --only-upgrade nodejs
 fi
 
-echo ""
+echo
+echo "=== Downloading ==="
+# Next to the old binaries as *.new, while the services keep running.
+
+# Removes what was downloaded so far, and stops.
+download_failed() {
+    rm -f /myapps/caddy/caddy.new /myapps/pocketbase/pocketbase.zip \
+        /myapps/pocketbase/pocketbase.new /myapps/filebrowser/filebrowser.new
+    echo "ERROR: Download failed (see above). The services keep running on their current versions." >&2
+    echo "Run this again once that's fixed: $RUN_AGAIN" >&2
+    exit 1
+}
+
+# Recreate dirs so we can repair a partially deleted /myapps.
+mkdir -p /myapps/caddy /myapps/pocketbase /myapps/filebrowser /myapps/nodeapp
+
+curl -fsSL -o /myapps/caddy/caddy.new \
+    "https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com/mholt/caddy-ratelimit" || download_failed
+curl -fsSL -o /myapps/pocketbase/pocketbase.zip \
+    "https://github.com/pocketbase/pocketbase/releases/download/v$pocketbase_latest/pocketbase_${pocketbase_latest}_linux_amd64.zip" || download_failed
+unzip -p /myapps/pocketbase/pocketbase.zip pocketbase > /myapps/pocketbase/pocketbase.new || download_failed
+rm /myapps/pocketbase/pocketbase.zip
+curl -fsSL -o /myapps/filebrowser/filebrowser.new \
+    "https://github.com/gtsteffaniak/filebrowser/releases/download/v$filebrowser_latest/linux-amd64-filebrowser" || download_failed
+for bin in "${BINARIES[@]}"; do
+    [ -s "$bin.new" ] || download_failed    # an empty download counts as failed
+done
+
+echo
+echo "=== Installing ==="
+# Only the programs 07–10 have set up; Supervisor doesn't know the others.
+registered=()
+for prog in "${PROGRAMS[@]}"; do
+    [ -f "/etc/supervisor/conf.d/$prog.conf" ] && registered+=("$prog")
+done
+
+if ! $install_mode; then
+    for bin in "${BINARIES[@]}"; do
+        cp "$bin" "$bin.bak"
+    done
+    for prog in "${registered[@]}"; do
+        if is_up "$prog"; then
+            supervisorctl stop "$prog"
+        fi
+    done
+fi
+for bin in "${BINARIES[@]}"; do
+    chmod +x "$bin.new"
+    mv "$bin.new" "$bin"
+done
+
+echo
 echo "=== Starting services ==="
+not_started=()
 # Not in install mode: a service's settings may be gone too (say, after
 # deleting /myapps), and 07–10 write them before starting it.
-if $INSTALL_MODE || [ ${#REGISTERED[@]} -eq 0 ]; then
+if $install_mode || [ ${#registered[@]} -eq 0 ]; then
     echo "(07–10 set up and start them.)"
 else
-    for prog in "${REGISTERED[@]}"; do
-        start_if_autostart "$prog"
+    for prog in "${registered[@]}"; do
+        start_if_autostart "$prog" || not_started+=("$prog")
     done
 fi
 
-echo ""
+echo
 echo "=== Done ==="
-echo "Caddy:       $(/myapps/caddy/caddy version 2>/dev/null | head -1)"
-echo "Pocketbase:  $(/myapps/pocketbase/pocketbase --version 2>/dev/null)"
-echo "Filebrowser: $(/myapps/filebrowser/filebrowser version 2>/dev/null | awk '/Version/{print $3}')"
-echo "Node.js:     $(node -v 2>/dev/null)"
-echo ""
+echo "Caddy:       $(version_of /myapps/caddy/caddy version)"
+echo "Pocketbase:  $(version_of /myapps/pocketbase/pocketbase --version)"
+echo "Filebrowser: $(version_of /myapps/filebrowser/filebrowser version)"
+echo "Node.js:     $(version_of node -v)"
 if ls /myapps/caddy/caddy.bak /myapps/pocketbase/pocketbase.bak /myapps/filebrowser/filebrowser.bak >/dev/null 2>&1; then
-    echo "Backups kept at *.bak — remove with:"
+    echo
+    echo "The previous binaries are kept as *.bak. Remove them with:"
     echo "  sudo rm /myapps/caddy/caddy.bak /myapps/pocketbase/pocketbase.bak /myapps/filebrowser/filebrowser.bak"
+fi
+
+if [ ${#not_started[@]} -gt 0 ]; then
+    echo
+    echo "ERROR: ${not_started[*]} didn't start. Its log says why:" >&2
+    for prog in "${not_started[@]}"; do
+        echo "  sudo tail /myapps/$prog/$prog.err.log" >&2
+    done
+    echo "Going back to the previous version: see the top of $SETUP_DIR/06_install_or_update_binaries.sh" >&2
+    exit 1
 fi

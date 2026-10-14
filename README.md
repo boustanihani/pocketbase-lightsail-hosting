@@ -22,14 +22,14 @@ Plus automatic HTTPS for your domain, key-only SSH, SSHGuard, network hardening,
    curl -fsSL https://raw.githubusercontent.com/boustanihani/pocketbase-lightsail-hosting/main/install.sh | sudo bash
    ```
 
-   Press ENTER to go through the settings step by step (ENTER again keeps each default), or 2 to install with the defaults right away. It takes a few minutes and ends with a summary: the URLs, and the Pocketbase password, which is shown only this once.
+   Press ENTER to go through the settings step by step (ENTER again keeps each default), or type 2 and ENTER to install with the defaults right away. It takes a few minutes and ends with a summary: the URLs, and the Pocketbase password, which is shown only this once.
 
 Rather read and adjust everything first? Download only, then run all parts or one at a time:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/boustanihani/pocketbase-lightsail-hosting/main/download.sh | sudo bash
 sudo nano /myapps/setup/00_config.cfg
-sudo bash /myapps/setup/01_run_all_scripts.sh          # then 2: use the file as it is
+sudo bash /myapps/setup/01_run_all_scripts.sh          # then 2 + ENTER: use the file as it is
 sudo bash /myapps/setup/02_install_dependencies.sh     # …or one part at a time: 02, 03, …
 ```
 
@@ -66,7 +66,7 @@ They're in [`parts/`](parts/), and on the server in `/myapps/setup/`. Each one e
 
 **HTTPS:** point your domain at the instance, set `CUSTOM_DOMAIN` in `/myapps/setup/00_config.cfg`, then run `sudo bash /myapps/setup/07_config_caddy.sh`.
 
-**Updating** Caddy, Pocketbase, Filebrowser and Node.js. It backs up the binaries and rolls back if a download fails:
+**Updating** Caddy, Pocketbase, Filebrowser and Node.js. Everything is downloaded while the services keep running, so a failed download changes nothing, and they're down for only a few seconds. The previous binaries are kept as `*.bak`:
 
 ```bash
 sudo bash /myapps/setup/06_install_or_update_binaries.sh

@@ -5,6 +5,10 @@
 #   /filebrowser/   → Filebrowser  localhost:8091
 #   /nodeapp/       → Node app     localhost:NODEAPP_PORT, without the prefix
 #
+# /filebrowser and /nodeapp redirect to the same path with a slash, so the
+# relative links in their pages work. 308 is a permanent redirect that keeps
+# a POST a POST.
+#
 # Limits: request bodies up to 100 MB (uploads), and a 6-minute read timeout
 # towards Pocketbase, so long requests aren't cut short.
 #
@@ -44,14 +48,14 @@ ${CUSTOM_DOMAIN} {
 	}
 
 	handle /filebrowser {
-		redir {path}/ permanent
+		redir {path}/ 308
 	}
 	handle /filebrowser/* {
 		reverse_proxy localhost:8091
 	}
 
-	handle_path /nodeapp {
-		reverse_proxy localhost:${NODEAPP_PORT}
+	handle /nodeapp {
+		redir {path}/ 308
 	}
 	handle_path /nodeapp/* {
 		reverse_proxy localhost:${NODEAPP_PORT}

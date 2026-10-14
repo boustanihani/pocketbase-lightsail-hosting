@@ -30,13 +30,14 @@ source "$(dirname "$0")/common.sh"
 PB=/myapps/pocketbase/pocketbase
 
 # Before the service starts, so the two don't set up a new database at once.
+# The -- ends the options, so a password starting with - isn't taken for one.
 if [ -n "$POCKETBASE_PASS" ]; then
-    "$PB" superuser upsert "$POCKETBASE_EMAIL" "$POCKETBASE_PASS"
+    "$PB" superuser upsert -- "$POCKETBASE_EMAIL" "$POCKETBASE_PASS"
 else
     # Letters and digits only, so a double-click selects all of it.
     pass=$(head -c 64 /dev/urandom | base64 -w0 | tr -dc 'A-Za-z0-9')
     pass=${pass:0:20}
-    if out=$("$PB" superuser create "$POCKETBASE_EMAIL" "$pass" 2>&1); then
+    if out=$("$PB" superuser create -- "$POCKETBASE_EMAIL" "$pass" 2>&1); then
         echo "$out"
         show_secret "Pocketbase superuser: $POCKETBASE_EMAIL / $pass"
     elif [[ $out == *"must be unique"* ]]; then

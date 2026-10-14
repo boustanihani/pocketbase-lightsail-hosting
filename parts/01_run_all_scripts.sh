@@ -3,12 +3,12 @@
 #
 #   sudo bash /myapps/setup/01_run_all_scripts.sh
 #
-# First it asks how:
-#   1 or ENTER  go through every setting in 00_config.cfg (ENTER keeps the
-#               value in brackets); the answers are saved back to the file,
-#               except the Pocketbase password
-#   2           silent installation with 00_config.cfg as it is
-#   c           cancel
+# First it asks how (type the answer, then ENTER):
+#   1 or just ENTER  go through every setting in 00_config.cfg (ENTER keeps
+#                    the value in brackets); the answers are saved back to the
+#                    file, except the Pocketbase password
+#   2                silent installation with 00_config.cfg as it is
+#   c                cancel
 # Without a terminal (run from another script, say) it installs silently.
 #
 # Every part is safe to run again. After a failure, fix the cause and run this
@@ -18,6 +18,8 @@
 # the end, which holds the generated Pocketbase password and only appears on
 # screen. If your SSH connection drops, the installation keeps running; log in
 # again and follow it with:  sudo tail -f /myapps/setup/install.log
+# Only that summary is lost then; 08_config_pocketbase.sh says how to set a
+# new password.
 
 source "$(dirname "$0")/common.sh"
 
@@ -102,8 +104,7 @@ confirm() {
     done
     echo
     while true; do
-        read -rsn1 -p "ENTER = install, n = change them, c = cancel " key
-        echo
+        read -rp "ENTER = install, n = change them, c = cancel: " key || cancel
         case $key in
             '')  return 0 ;;
             n|N) return 1 ;;
@@ -142,12 +143,11 @@ cancel() {
 
 if [ -t 0 ]; then
     echo
-    echo "  1) Press 1 or ENTER to configure all settings (step by step)"
-    echo "  2) Press 2 for a silent installation using the values in 00_config.cfg"
-    echo "  c) Press c to cancel"
+    echo "  1) Configure all settings, step by step (or just ENTER)"
+    echo "  2) Silent installation, using the values in 00_config.cfg"
+    echo "  c) Cancel"
     while true; do
-        read -rsn1 -p "> " choice
-        echo
+        read -rp "Your choice, then ENTER: " choice || cancel
         case $choice in
             ''|1) until configure; confirm; do :; done
                   save_settings
@@ -196,6 +196,10 @@ if [ -z "$failed" ]; then
 else
     echo "===== $(date) — installation FAILED in $failed (see above) ====="
     echo "Fix the cause, then run this again: sudo bash $SETUP_DIR/01_run_all_scripts.sh"
+fi
+if [ -s "$SECRETS_FILE" ]; then
+    echo "(The generated Pocketbase password is shown only on screen, not in this log."
+    echo " Missed it? How to set a new one: see the top of $SETUP_DIR/08_config_pocketbase.sh)"
 fi
 
 exec >&3 2>&3 3>&-                   # stop logging
