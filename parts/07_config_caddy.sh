@@ -12,9 +12,10 @@
 # Limits: request bodies up to 100 MB (uploads), and a 6-minute read timeout
 # towards Pocketbase, so long requests aren't cut short.
 #
-# The binary (from 06) includes the mholt/caddy-ratelimit module. Nothing uses
-# it yet — Filebrowser limits its own logins — but the `order rate_limit` line
-# lets you drop a rate_limit block into any route later.
+# With CADDY_RATELIMIT=true, 06 builds Caddy with the mholt/caddy-ratelimit
+# module. Nothing uses it yet — Filebrowser limits its own logins — but you
+# can drop a rate_limit block into any route. The module puts itself before
+# basic_auth; the commented `order` line shows how to change that.
 #
 # HTTPS: set CUSTOM_DOMAIN in 00_config.cfg and run this part again. Caddy
 # then gets a Let's Encrypt certificate, redirects HTTP to HTTPS and renews
@@ -39,7 +40,7 @@ caddyfile() {
 # Written by $SETUP_DIR/07_config_caddy.sh from 00_config.cfg.
 # Change the settings there and run it again; edits here get overwritten.
 {
-	order rate_limit before basic_auth
+	# order rate_limit before basic_auth
 }
 
 ${CUSTOM_DOMAIN} {

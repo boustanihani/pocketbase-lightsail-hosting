@@ -11,16 +11,18 @@
 # happens while the services keep running: first Node.js (the latest within
 # NODE_MAJOR, from NodeSource), then the latest Pocketbase and the newest
 # stable Filebrowser within FILEBROWSER_MAJOR, downloaded next to the old
-# binaries as *.new, and Caddy too if there's a new version. If any of that
-# fails, the services keep running on their current versions. Only then
-# comes the swap, a few seconds of downtime: the old binaries are kept as
-# *.bak, the services stop, the new binaries move into place, and each
-# service whose Supervisor config says autostart=true starts again. Services
-# with autostart=false get the new binary but stay stopped.
+# binaries as *.new, and Caddy too if needed (below). If any of that fails,
+# the services keep running on their current versions. Only then comes the
+# swap, a few seconds of downtime: the old binaries are kept as *.bak, the
+# services stop, the new binaries move into place, and each service whose
+# Supervisor config says autostart=true starts again. Services with
+# autostart=false get the new binary but stay stopped.
 #
-# Why Caddy only when there's a new version? caddyserver.com builds it with
-# the rate-limit module on request, which takes a while and sometimes doesn't
-# answer at all. Every download gives up after 5 minutes without a result.
+# Caddy: the newest version within CADDY_MAJOR, only when it's new or
+# CADDY_RATELIMIT changed. With CADDY_RATELIMIT=false, the official build
+# from GitHub (seconds). With true, built here with the rate-limit module,
+# using xcaddy as Caddy's maintainers recommend: about 5 minutes and 1 GB of
+# RAM. Every download gives up after 5 minutes without a result.
 #
 # A service that won't start with its new version doesn't keep the others
 # down: they start anyway, and the end of the output names it. Its .err.log
@@ -74,13 +76,21 @@ fi
 
 echo "=== Fetching latest versions ==="
 
-caddy_latest=$(curl -s --max-time 30 https://api.github.com/repos/caddyserver/caddy/releases/latest | jq -r '.tag_name | ltrimstr("v")' || true)
+# newest_release REPO REGEX: the newest version among REPO's last 100
+# releases whose tag matches REGEX, without the v.
+newest_release() {
+    curl -s --max-time 30 "https://api.github.com/repos/$1/releases?per_page=100" |
+        jq -r '.[].tag_name' | grep -E "$2" | sort -V | tail -n1 | sed 's/^v//'
+}
+
+# Newest vN.x.y; betas are vN.x.y-beta.n.
+caddy_latest=$(newest_release caddyserver/caddy "^v${CADDY_MAJOR}\.[0-9]+\.[0-9]+$" || true)
 pocketbase_latest=$(curl -s --max-time 30 https://api.github.com/repos/pocketbase/pocketbase/releases/latest | jq -r '.tag_name | ltrimstr("v")' || true)
 # Newest vN.x.y-stable (betas aren't marked prerelease).
-filebrowser_latest=$(curl -s --max-time 30 "https://api.github.com/repos/gtsteffaniak/filebrowser/releases?per_page=100" | jq -r '.[].tag_name' | grep -E "^v${FILEBROWSER_MAJOR}\.[0-9]+\.[0-9]+-stable$" | sort -V | tail -n1 | sed 's/^v//' || true)
+filebrowser_latest=$(newest_release gtsteffaniak/filebrowser "^v${FILEBROWSER_MAJOR}\.[0-9]+\.[0-9]+-stable$" || true)
 
-if [ -z "$caddy_latest" ] || [ "$caddy_latest" = "null" ]; then
-    echo "ERROR: Couldn't get Caddy's latest version from GitHub." >&2
+if [ -z "$caddy_latest" ]; then
+    echo "ERROR: No Caddy $CADDY_MAJOR.x found on GitHub. Is CADDY_MAJOR in $CONFIG right?" >&2
     exit 1
 fi
 if [ -z "$pocketbase_latest" ] || [ "$pocketbase_latest" = "null" ]; then
@@ -93,6 +103,10 @@ if [ -z "$filebrowser_latest" ]; then
 fi
 
 caddy_current=$(version_of /myapps/caddy/caddy version)
+# Whether the installed Caddy has the rate-limit module: true or false.
+caddy_has_ratelimit=false
+modules=$(/myapps/caddy/caddy list-modules 2>/dev/null || true)
+[[ $modules == *http.handlers.rate_limit* ]] && caddy_has_ratelimit=true
 pocketbase_current=$(version_of /myapps/pocketbase/pocketbase --version)
 filebrowser_current=$(version_of /myapps/filebrowser/filebrowser version)
 node_current=$(version_of node -v)
@@ -140,7 +154,7 @@ fi
 echo
 echo "=== Downloading ==="
 # Next to the old binaries as *.new, while the services keep running.
-NEW_FILES=(/myapps/caddy/caddy.new /myapps/pocketbase/pocketbase.zip
+NEW_FILES=(/myapps/caddy/caddy.tar.gz /myapps/caddy/caddy.new /myapps/pocketbase/pocketbase.zip
     /myapps/pocketbase/pocketbase.new /myapps/filebrowser/filebrowser.new)
 
 # download WHAT URL FILE: says what it loads. Fails on an error, an empty
@@ -153,21 +167,48 @@ download() {
 # Removes what was downloaded so far, and stops.
 download_failed() {
     rm -f "${NEW_FILES[@]}"
-    echo "ERROR: Download failed (see above). The services keep running on their current versions." >&2
+    echo "ERROR: Getting the new binaries failed (see above). The services keep running on their current versions." >&2
     echo "Run this again once that's fixed: $RUN_AGAIN" >&2
     exit 1
+}
+
+# Builds Caddy with the rate-limit module the way Caddy's maintainers
+# recommend: with xcaddy, and the latest Go from go.dev (Ubuntu's is too
+# old). Go and everything the build fetches stay in a temporary folder
+# that's deleted afterwards.
+build_caddy() {
+    local dir file sha ok
+    dir=$(mktemp -d)
+    read -r file sha < <(curl -fsS --max-time 30 "https://go.dev/dl/?mode=json" |
+        jq -r '.[0].files[] | select(.os == "linux" and .arch == "amd64" and .kind == "archive") | "\(.filename) \(.sha256)"')
+    download "Go, to build Caddy" "https://go.dev/dl/$file" "$dir/go.tar.gz" &&
+        echo "$sha  $dir/go.tar.gz" | sha256sum -c --quiet &&
+        tar -xzf "$dir/go.tar.gz" -C "$dir" &&
+        echo "Building Caddy $caddy_latest with the rate-limit module (takes several minutes) …" &&
+        PATH="$dir/go/bin:$PATH" GOPATH="$dir/gopath" GOCACHE="$dir/cache" \
+            "$dir/go/bin/go" run github.com/caddyserver/xcaddy/cmd/xcaddy@latest build "v$caddy_latest" \
+            --with github.com/mholt/caddy-ratelimit --output /myapps/caddy/caddy.new
+    ok=$?
+    rm -rf "$dir"
+    return $ok
 }
 
 # Recreate dirs so we can repair a partially deleted /myapps.
 mkdir -p /myapps/caddy /myapps/pocketbase /myapps/filebrowser /myapps/nodeapp
 rm -f "${NEW_FILES[@]}"    # leftovers of an interrupted run
 
-if [ "$caddy_current" != "$caddy_latest" ]; then
-    download "Caddy $caddy_latest (built by caddyserver.com, can take a few minutes)" \
-        "https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com/mholt/caddy-ratelimit" \
-        /myapps/caddy/caddy.new || download_failed
-else
+# Caddy only when there's a new version, or when the installed one doesn't
+# match CADDY_RATELIMIT.
+if [ "$caddy_current" = "$caddy_latest" ] && [ "$caddy_has_ratelimit" = "$CADDY_RATELIMIT" ]; then
     echo "Caddy $caddy_current is the latest version and stays."
+elif [ "$CADDY_RATELIMIT" = true ]; then
+    build_caddy || download_failed
+else
+    download "Caddy $caddy_latest" \
+        "https://github.com/caddyserver/caddy/releases/download/v$caddy_latest/caddy_${caddy_latest}_linux_amd64.tar.gz" \
+        /myapps/caddy/caddy.tar.gz || download_failed
+    tar -xzOf /myapps/caddy/caddy.tar.gz caddy > /myapps/caddy/caddy.new || download_failed
+    rm /myapps/caddy/caddy.tar.gz
 fi
 download "Pocketbase $pocketbase_latest" \
     "https://github.com/pocketbase/pocketbase/releases/download/v$pocketbase_latest/pocketbase_${pocketbase_latest}_linux_amd64.zip" \

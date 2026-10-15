@@ -41,7 +41,7 @@ They're in [`parts/`](parts/), and on the server in `/myapps/setup/`. Each one e
 
 | Part | What it does |
 |---|---|
-| [`00_config.cfg`](parts/00_config.cfg) | All settings: domain, Pocketbase superuser, autostart, Node app, major versions |
+| [`00_config.cfg`](parts/00_config.cfg) | All settings: domain, Pocketbase superuser, autostart, Node app, Caddy's rate-limit module, major versions |
 | [`01_run_all_scripts.sh`](parts/01_run_all_scripts.sh) | Asks for the settings, runs 02–10, logs to `install.log` |
 | [`02_install_dependencies.sh`](parts/02_install_dependencies.sh) | System update and packages |
 | [`03_harden_system.sh`](parts/03_harden_system.sh) | Key-only SSH, network kernel settings |
