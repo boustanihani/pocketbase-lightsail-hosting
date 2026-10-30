@@ -85,7 +85,12 @@ newest_release() {
 
 # Newest vN.x.y; betas are vN.x.y-beta.n.
 caddy_latest=$(newest_release caddyserver/caddy "^v${CADDY_MAJOR}\.[0-9]+\.[0-9]+$" || true)
-pocketbase_latest=$(curl -s --max-time 30 https://api.github.com/repos/pocketbase/pocketbase/releases/latest | jq -r '.tag_name | ltrimstr("v")' || true)
+# Pocketbase moved from GitHub (archived at v0.40.6) to ganigeorgiev.com with
+# v0.41.0. Newest release of its "default" channel, not of the v0.22.x one.
+pocketbase_latest=$(curl -s --max-time 30 -G https://ganigeorgiev.com/api/collections/releases/records \
+    --data-urlencode "filter=draft=false && channel.name='default' && channel.repository.name='pocketbase' && channel.repository.project.name='pocketbase'" \
+    -d sort=-semver -d perPage=1 -d skipTotal=1 -d fields=tag |
+    jq -r '.items[0].tag | ltrimstr("v")' || true)
 # Newest vN.x.y-stable (betas aren't marked prerelease).
 filebrowser_latest=$(newest_release gtsteffaniak/filebrowser "^v${FILEBROWSER_MAJOR}\.[0-9]+\.[0-9]+-stable$" || true)
 
@@ -94,7 +99,7 @@ if [ -z "$caddy_latest" ]; then
     exit 1
 fi
 if [ -z "$pocketbase_latest" ] || [ "$pocketbase_latest" = "null" ]; then
-    echo "ERROR: Couldn't get Pocketbase's latest version from GitHub." >&2
+    echo "ERROR: Couldn't get Pocketbase's latest version from ganigeorgiev.com." >&2
     exit 1
 fi
 if [ -z "$filebrowser_latest" ]; then
@@ -211,7 +216,7 @@ else
     rm /myapps/caddy/caddy.tar.gz
 fi
 download "Pocketbase $pocketbase_latest" \
-    "https://github.com/pocketbase/pocketbase/releases/download/v$pocketbase_latest/pocketbase_${pocketbase_latest}_linux_amd64.zip" \
+    "https://ganigeorgiev.com/meta/pocketbase/pocketbase/download/v$pocketbase_latest/pocketbase_${pocketbase_latest}_linux_amd64.zip" \
     /myapps/pocketbase/pocketbase.zip || download_failed
 unzip -p /myapps/pocketbase/pocketbase.zip pocketbase > /myapps/pocketbase/pocketbase.new || download_failed
 rm /myapps/pocketbase/pocketbase.zip
