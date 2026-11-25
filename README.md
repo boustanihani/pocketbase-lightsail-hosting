@@ -66,7 +66,7 @@ They're in [`parts/`](parts/), and on the server in `/myapps/setup/`. Each one e
 
 **HTTPS:** point your domain at the instance, set `CUSTOM_DOMAIN` in `/myapps/setup/00_config.cfg`, then run `sudo bash /myapps/setup/07_config_caddy.sh`.
 
-**Updating** Caddy, Pocketbase, Filebrowser and Node.js. Everything is downloaded while the services keep running, so a failed download changes nothing, and they're down for only a few seconds. The previous binaries are kept as `*.bak`:
+**Updating** Caddy, Pocketbase, Filebrowser and Node.js. Everything is downloaded while the services keep running, so a failed download changes nothing, and they're down for only a few seconds. The previous binaries are kept as `*.bak`, and Pocketbase's own update (`pocketbase update`) backs up `pb_data` first, to restore under Settings → Backups in its admin UI:
 
 ```bash
 sudo bash /myapps/setup/06_install_or_update_binaries.sh

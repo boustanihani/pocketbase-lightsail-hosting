@@ -9,26 +9,42 @@
 # Update mode (the normal case afterwards): shows the versions and asks
 # before going on (only in a terminal). Everything that needs the network
 # happens while the services keep running: first Node.js (the latest within
-# NODE_MAJOR, from NodeSource), then the latest Pocketbase and the newest
-# stable Filebrowser within FILEBROWSER_MAJOR, downloaded next to the old
-# binaries as *.new, and Caddy too if needed (below). If any of that fails,
-# the services keep running on their current versions. Only then comes the
-# swap, a few seconds of downtime: the old binaries are kept as *.bak, the
-# services stop, the new binaries move into place, and each service whose
-# Supervisor config says autostart=true starts again. Services with
-# autostart=false get the new binary but stay stopped.
+# NODE_MAJOR, from NodeSource), then the newest stable Filebrowser within
+# FILEBROWSER_MAJOR, downloaded next to the old binary as *.new, Caddy too
+# if needed (below), and last the latest Pocketbase, which updates itself
+# (below). If any of that fails, the services keep running on their current
+# versions. Only then comes the swap, a few seconds of downtime: the old
+# binaries are kept as *.bak, the services stop, the new binaries move into
+# place, and each service whose Supervisor config says autostart=true starts
+# again. Services with autostart=false get the new binary but stay stopped.
+#
+# Pocketbase: `pocketbase update` downloads the new version, puts it in
+# place, and backs up pb_data before the new version ever runs, as
+# pb_data/backups/@update_vX.Y.Z.zip. A new version may change the database
+# when it first starts, so going back can take that backup, not just the
+# old binary. The running service doesn't mind: it keeps its old binary
+# until the swap, and the backup copies the databases with SQLite's VACUUM
+# INTO, a consistent snapshot even while the service writes. Each backup is
+# a full copy of pb_data, so delete old ones in the admin UI under
+# Settings → Backups before they fill the disk; without room for a new one,
+# the update fails and changes nothing. A fresh server has no binary to
+# update yet: install mode downloads it.
 #
 # Caddy: the newest version within CADDY_MAJOR, only when it's new or
 # CADDY_RATELIMIT changed. With CADDY_RATELIMIT=false, the official build
 # from GitHub (seconds). With true, built here with the rate-limit module,
 # using xcaddy as Caddy's maintainers recommend: about 5 minutes and 1 GB of
-# RAM. Every download gives up after 5 minutes without a result.
+# RAM. Every download gives up after 5 minutes without a result;
+# Pocketbase's update, backup included, after 30.
 #
 # A service that won't start with its new version doesn't keep the others
 # down: they start anyway, and the end of the output names it. Its .err.log
 # says why. To go back to the previous version, e.g. of Caddy:
 #   sudo mv /myapps/caddy/caddy.bak /myapps/caddy/caddy
 #   sudo supervisorctl start caddy
+# For Pocketbase, the same two commands, then restore its data in the admin
+# UI under Settings → Backups: @update_vX.Y.Z.zip, X.Y.Z being the version
+# you're leaving. Pocketbase restarts after that, on the old binary.
 #
 # Why pin Filebrowser's major version? Its betas are regular GitHub releases,
 # not pre-releases, so `releases/latest` can't be trusted to mean stable —
@@ -198,6 +214,24 @@ build_caddy() {
     return $ok
 }
 
+# Pocketbase updates itself (see the top). `pocketbase update` deletes the old
+# binary, so that's copied to .bak first, and put back if the update fails,
+# hangs and gets stopped, or does nothing: it asks first when it suspects
+# Docker or NixOS, takes no answer as no, and still exits with success.
+update_pocketbase() {
+    local pb=/myapps/pocketbase/pocketbase status=0
+    echo "Pocketbase $pocketbase_latest, with pocketbase update …"
+    cp "$pb" "$pb.bak"
+    timeout 30m "$pb" update --backup || status=$?
+    if [ $status -eq 0 ] && [ "$(version_of "$pb" --version)" = "$pocketbase_latest" ]; then
+        return 0
+    fi
+    [ $status -eq 124 ] && echo "pocketbase update took longer than 30 minutes and was stopped." >&2
+    mv -f "$pb.bak" "$pb"
+    rm -f "$pb.old"    # left behind when it's stopped halfway
+    return 1
+}
+
 # Recreate dirs so we can repair a partially deleted /myapps.
 mkdir -p /myapps/caddy /myapps/pocketbase /myapps/filebrowser /myapps/nodeapp
 rm -f "${NEW_FILES[@]}"    # leftovers of an interrupted run
@@ -215,14 +249,21 @@ else
     tar -xzOf /myapps/caddy/caddy.tar.gz caddy > /myapps/caddy/caddy.new || download_failed
     rm /myapps/caddy/caddy.tar.gz
 fi
-download "Pocketbase $pocketbase_latest" \
-    "https://ganigeorgiev.com/meta/pocketbase/pocketbase/download/v$pocketbase_latest/pocketbase_${pocketbase_latest}_linux_amd64.zip" \
-    /myapps/pocketbase/pocketbase.zip || download_failed
-unzip -p /myapps/pocketbase/pocketbase.zip pocketbase > /myapps/pocketbase/pocketbase.new || download_failed
-rm /myapps/pocketbase/pocketbase.zip
 download "Filebrowser ${filebrowser_latest%-stable}" \
     "https://github.com/gtsteffaniak/filebrowser/releases/download/v$filebrowser_latest/linux-amd64-filebrowser" \
     /myapps/filebrowser/filebrowser.new || download_failed
+# Pocketbase last: its update puts the new binary in place right away.
+if $install_mode; then
+    download "Pocketbase $pocketbase_latest" \
+        "https://ganigeorgiev.com/meta/pocketbase/pocketbase/download/v$pocketbase_latest/pocketbase_${pocketbase_latest}_linux_amd64.zip" \
+        /myapps/pocketbase/pocketbase.zip || download_failed
+    unzip -p /myapps/pocketbase/pocketbase.zip pocketbase > /myapps/pocketbase/pocketbase.new || download_failed
+    rm /myapps/pocketbase/pocketbase.zip
+elif [ "$pocketbase_current" = "$pocketbase_latest" ]; then
+    echo "Pocketbase $pocketbase_current is the latest version and stays."
+else
+    update_pocketbase || download_failed
+fi
 
 echo
 echo "=== Installing ==="
@@ -280,6 +321,14 @@ if [ ${#backups[@]} -gt 0 ]; then
     echo
     echo "The previous binaries are kept as *.bak. Remove them with:"
     echo "  sudo rm ${backups[*]}"
+fi
+# The pb_data backups pocketbase update made (none here if they go to S3).
+pb_backups=(/myapps/pocketbase/pb_data/backups/@update_*.zip)
+if [ -e "${pb_backups[0]}" ]; then
+    echo
+    echo "Pocketbase's backups from its updates, each a full copy of pb_data."
+    echo "Delete the ones you don't need in its admin UI, under Settings → Backups:"
+    du -h "${pb_backups[@]}" | sed 's/^/  /'
 fi
 
 if [ ${#not_started[@]} -gt 0 ]; then
