@@ -14,14 +14,18 @@
 # config.yaml, since Filebrowser takes no command-line flags for any of this:
 #   baseURL            it's served under /filebrowser/, so its pages, assets
 #                      and API need the prefix
-#   listen: 127.0.0.1  goes together with trustProxyHeaders. Behind Caddy,
-#                      every request comes from 127.0.0.1, so without trusting
-#                      X-Forwarded-For, the login rate limit would treat all
-#                      visitors as one: eight wrong passwords from anyone
-#                      would lock admin out for everybody. Trusting that
-#                      header is only safe because Filebrowser listens on
-#                      localhost only, and Caddy replaces any X-Forwarded-For
-#                      a client sends.
+#   listen: 127.0.0.1  goes together with trustProxyHeaders and
+#                      trustedProxies. Behind Caddy, every request comes from
+#                      127.0.0.1, so without trusting X-Forwarded-For, the
+#                      login rate limit would treat all visitors as one: eight
+#                      wrong passwords from anyone would lock admin out for
+#                      everybody. Trusting that header is only safe because
+#                      Filebrowser listens on localhost only, and Caddy
+#                      replaces any X-Forwarded-For a client sends.
+#   trustedProxies     who may send that header: Caddy, from 127.0.0.1. Since
+#                      Filebrowser 2.1, trustProxyHeaders alone isn't enough;
+#                      without this list, Filebrowser ignores the header and
+#                      warns about it at every start.
 #   name: supervisor   the source's label in the sidebar (else "conf.d")
 # Its database (filebrowser.sqlite) and cache (tmp/) are created in
 # /myapps/filebrowser.
@@ -51,6 +55,8 @@ http:
   listen: 127.0.0.1
   baseURL: /filebrowser
   trustProxyHeaders: true
+  trustedProxies:
+    - 127.0.0.1
 server:
   sources:
     - path: /myapps
